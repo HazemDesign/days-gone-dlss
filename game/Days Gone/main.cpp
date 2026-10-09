@@ -28,7 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -1053,6 +1053,18 @@ static void CViewStashReport(bool ok, int src, const char* detail)
       reshade::log::message(ok ? reshade::log::level::info : reshade::log::level::warning, b);
    }
 }
+
+// Blit-guard: the persistent viewer blit issues its own Draw, which re-enters
+// this same draw hook and satisfies the same blit gate (large target, vsrc
+// set) -> unbounded recursion -> silent death (no Windows event). The
+// g_cview_last_target/g_cview_target_frame throttle was never wired, so this
+// thread_local re-entrancy flag is the guard: inner Draws skip the blit and
+// fall through to the normal draw path. Display path only.
+static thread_local bool g_in_copy_blit = false;
+struct CopyBlitScope
+{
+   ~CopyBlitScope() { g_in_copy_blit = false; }
+};
 
 // M9e: fullscreen copy with FORCED clean state. The slot leaves blending,
 // a 1920-viewport and scissor enabled -- inheriting them blended our copies
@@ -4551,6 +4563,14 @@ public:
          }
          else if (vsrc && device_data.game)
          {
+            // Blit-guard: our own copy Draw re-enters here -- never blit
+            // re-entrantly, fall through to the normal draw path instead.
+            if (g_in_copy_blit)
+            {
+               // fall through (no viewer work, game draw proceeds untouched)
+            }
+            else
+            {
             ID3D11RenderTargetView* wrtv2 = nullptr;
             native_device_context->OMGetRenderTargets(1, &wrtv2, nullptr);
             if (wrtv2)
@@ -4574,6 +4594,8 @@ public:
                           vd2.Format != DXGI_FORMAT_R16G16_UNORM)
                       {
                           auto& gdview = *static_cast<DaysGoneDeviceData*>(device_data.game);
+                          g_in_copy_blit = true;
+                          CopyBlitScope blit_scope; // clears guard even on early return below
                           vdone2 = RunCopyPass(native_device, native_device_context, device_data, gdview,
                              vsrc.get(), wrtv2, vd2.Width, vd2.Height,
                              g_swap_output.load(std::memory_order_relaxed), false,
@@ -4588,7 +4610,7 @@ public:
                }
                wrtv2->Release();
                 if (vdone2)
-                {
+               {
                    // M31: persistent -- do NOT clear pending (last draw wins).
                    // Cleared only when the source is set OFF or the SRV dies.
                    if (g_mark_sr.load(std::memory_order_relaxed))
@@ -4596,7 +4618,8 @@ public:
                    return DrawOrDispatchOverrideType::Skip;
                 }
              }
-          }
+            }
+         }
           } // M40 else (viewer source ON)
        }
       // M2 freezer: skip checked hashes live (master + per-hash set).
