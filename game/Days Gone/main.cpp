@@ -34,7 +34,7 @@
 #define DG_HOTKEY_DLSS VK_F9
 #define DG_HOTKEY_TRACE VK_F10
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -424,6 +424,8 @@ static std::atomic<uint64_t> g_view_projrej{ 0 };
 // viewfilter: small-RT draws refused pooling (log-only counter) + per-present
 // snapshots (pool reads, skips) + FNV-1a of the elected R block.
 static std::atomic<uint64_t> g_view_pool_skips{ 0 };
+// depthfilter: large DSVs refused caching when no gameplay RT is alongside.
+static std::atomic<uint64_t> g_depth_cache_skips{ 0 };
 static std::atomic<int> g_clast_preads{ 0 };
 static std::atomic<unsigned long long> g_clast_pskip{ 0 };
 static std::atomic<uint32_t> g_view_pick_cksum{ 0 };
@@ -2168,11 +2170,44 @@ public:
                   tex->Release();
                    if (d.Width >= 400 && d.Height >= 200) // M55: was 1000x500
                    {
+                      // depthfilter: same principle as viewfilter -- only cache
+                      // depth when a gameplay-sized color RT is bound ALONGSIDE
+                      // the DSV. Depth-only (shadow/cascade) or small-RT draws
+                      // leave the last fresh cache untouched (depth capture has
+                      // no perfcap -- just skip the store).
+                      bool depthGameplay = false;
+                      {
+                         ID3D11RenderTargetView* crtv = nullptr;
+                         native_device_context->OMGetRenderTargets(1, &crtv, nullptr);
+                         if (crtv)
+                         {
+                            ID3D11Resource* cres = nullptr;
+                            crtv->GetResource(&cres);
+                            if (cres)
+                            {
+                               ID3D11Texture2D* ctex = nullptr;
+                               if (SUCCEEDED(cres->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ctex))) && ctex)
+                               {
+                                  D3D11_TEXTURE2D_DESC crd = {};
+                                  ctex->GetDesc(&crd);
+                                  depthGameplay = (crd.Width >= 400 && crd.Height >= 200);
+                                  ctex->Release();
+                               }
+                               cres->Release();
+                            }
+                            crtv->Release();
+                         }
+                      }
+                      if (depthGameplay)
+                      {
                       auto& gd = *static_cast<DaysGoneDeviceData*>(device_data.game);
                       gd.cached_depth.attach(tmp);
                      tmp = nullptr;
                      gd.cached_depth_frame = g_hist_frame.load(std::memory_order_relaxed);
-                  }
+                      }
+                      else
+                         g_depth_cache_skips.fetch_add(1, std::memory_order_relaxed);
+                   }
                }
                if (tmp) tmp->Release();
             }
@@ -6229,6 +6264,7 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    if (!firstfi && fi != last_fi + 1) fibang = '!';
    firstfi = false; last_fi = fi;
    uint64_t dage = g_clast_dage.load(std::memory_order_relaxed);
+   uint64_t dskip = g_depth_cache_skips.load(std::memory_order_relaxed);
    uint64_t ccv = g_color_changes.load(std::memory_order_relaxed);
    int cvsrc = g_cview_stash_src.load(std::memory_order_relaxed);
    int cvok = g_cview_stash_ok.load(std::memory_order_relaxed);
@@ -6268,14 +6304,14 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    // stays sizeof-bounded regardless -- no repeat of the old overflow).
    char line[1408] = {};
    snprintf(line, sizeof(line),
-      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu cc=%llu",
+      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu dskip=%llu cc=%llu",
       (unsigned long long)present, DG_BUILD_ID,
       (unsigned long long)draws, (unsigned long long)frozen,
       (unsigned long long)att, (unsigned long long)runs, (unsigned long long)resets,
       mvst, (unsigned)mvhash, mvfmt, mvsrc, mvcode, owng, vfc, vfp2, vfo, ok ? 1 : 0, rst ? 1 : 0, jx, jy, jd00, jd01, jd26, jd27, jdcx, jdcy, cvst, fmaster,
       vpick, vnpool, preads, pskip, (unsigned)pickck, (unsigned long long)drej, (unsigned long long)dproj, vp00, vp11, rotmag,
       cown, cmsc, cmvsjit, cdec, cfx, cfy, csc, con, fovsl, fovtrue, (unsigned long long)fi, fibang,
-      (unsigned long long)dage, (unsigned long long)ccv);
+      (unsigned long long)dage, (unsigned long long)dskip, (unsigned long long)ccv);
 #if TEST || DEVELOPMENT
    AppendFullLogLine(hModule, line);
 #else
