@@ -34,7 +34,7 @@
 #define DG_HOTKEY_DLSS VK_F9
 #define DG_HOTKEY_TRACE VK_F10
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -421,6 +421,12 @@ static std::atomic<uint64_t> g_view_rejects{ 0 };
 static std::atomic<int> g_view_rejrun{ 0 };
 // viewpick: projection-stability rejections (election drop path only).
 static std::atomic<uint64_t> g_view_projrej{ 0 };
+// viewfilter: small-RT draws refused pooling (log-only counter) + per-present
+// snapshots (pool reads, skips) + FNV-1a of the elected R block.
+static std::atomic<uint64_t> g_view_pool_skips{ 0 };
+static std::atomic<int> g_clast_preads{ 0 };
+static std::atomic<unsigned long long> g_clast_pskip{ 0 };
+static std::atomic<uint32_t> g_view_pick_cksum{ 0 };
 // templog: FULL/FULLAGG snapshot + accumulator atoms (log-only, no behavior).
 static std::atomic<int> g_view_pick_snap{ -1 };
 static std::atomic<int> g_view_npool_snap{ 0 };
@@ -433,6 +439,14 @@ static std::atomic<uint64_t> g_agg_rotn{ 0 };
 static std::atomic<int64_t> g_agg_rotsum{ 0 }, g_agg_rotmax{ 0 }; // milli units
 static std::atomic<uint64_t> g_agg_resets{ 0 };
 static std::atomic<uint64_t> g_agg_projrej{ 0 };
+// viewfilter: FNV-1a over the 64B R block (cb+32) identifying a pooled view.
+static uint32_t ViewPickCksum(const float* cb)
+{
+   const uint8_t* b = (const uint8_t*)(cb + 32);
+   uint32_t h = 2166136261u;
+   for (int i = 0; i < 64; i++) { h ^= b[i]; h *= 16777619u; }
+   return h;
+}
 // viewpick commit: legacy stash commit (ex-1933-1939) + election bookkeeping.
 static void CommitViewPick(DaysGoneDeviceData& god, const float* src_cb, float p00, float p11, uint64_t frame, int pickidx)
 {
@@ -449,6 +463,7 @@ static void CommitViewPick(DaysGoneDeviceData& god, const float* src_cb, float p
    god.view_pick = pickidx;
    g_view_pick_snap.store(pickidx, std::memory_order_relaxed);
    g_view_npool_snap.store(god.view_pick_n, std::memory_order_relaxed);
+   g_view_pick_cksum.store(ViewPickCksum(src_cb), std::memory_order_relaxed);
    g_own_p00.store(p00, std::memory_order_relaxed);
    g_own_p11.store(p11, std::memory_order_relaxed);
 }
@@ -2186,11 +2201,41 @@ public:
                 vcb->GetDesc(&vbd);
                  if (vbd.ByteWidth == 2048)
                  {
-                    // perfcap: at most 8 staging reads per frame into the pool.
-                    // Draws beyond the cap skip the staging read entirely
-                    // (committed untouched, no counting, no logging).
-                    if (gdm.view_pool_frame != vsframe) { gdm.view_npool = 0; gdm.view_pool_reads = 0; gdm.view_pool_frame = vsframe; }
-                    if (gdm.view_pool_reads < 8)
+                     // viewfilter: RT-identity gate. The pool is built from the
+                     // first qualifying draws, so shadow/cascade/static views
+                     // (byte-identical across frames) fill it and the moving
+                     // gameplay view drawn later never enters. Only pool draws
+                     // targeting a gameplay-sized RT; the rest skip pooling
+                     // (no cap counting, committed untouched).
+                     bool isGameplay = false;
+                     {
+                        ID3D11RenderTargetView* rtv = nullptr;
+                        ID3D11DepthStencilView* dsv = nullptr;
+                        native_device_context->OMGetRenderTargets(1, &rtv, &dsv);
+                        if (rtv) {
+                           ID3D11Resource* res = nullptr;
+                           rtv->GetResource(&res);
+                           if (res) {
+                              ID3D11Texture2D* tex = nullptr;
+                              if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex) {
+                                 D3D11_TEXTURE2D_DESC rd = {};
+                                 tex->GetDesc(&rd);
+                                 isGameplay = (rd.Width >= 400 && rd.Height >= 200);
+                                 tex->Release();
+                              }
+                              res->Release();
+                           }
+                        }
+                        if (rtv) rtv->Release();
+                        if (dsv) dsv->Release();
+                     }
+                     if (!isGameplay)
+                        g_view_pool_skips.fetch_add(1, std::memory_order_relaxed);
+                     // perfcap: at most 8 staging reads per frame into the pool.
+                     // Draws beyond the cap skip the staging read entirely
+                     // (committed untouched, no counting, no logging).
+                     if (gdm.view_pool_frame != vsframe) { gdm.view_npool = 0; gdm.view_pool_reads = 0; gdm.view_pool_frame = vsframe; }
+                     if (isGameplay && gdm.view_pool_reads < 8)
                     {
                        ++gdm.view_pool_reads;
                     D3D11_BUFFER_DESC vsd = {};
@@ -3424,6 +3469,9 @@ public:
                          // Own fallback outcome (log-only): game MVs (5) or zero (6).
                          if (!own_done_c)
                             g_clast_ownguard.store(c_mv_real ? 5 : 6, std::memory_order_relaxed);
+                         // viewfilter snapshots (log-only): pool reads + skips this present.
+                         g_clast_preads.store(gd.view_pool_reads, std::memory_order_relaxed);
+                         g_clast_pskip.store(g_view_pool_skips.load(std::memory_order_relaxed), std::memory_order_relaxed);
                          g_clast_reset.store(creset ? 1 : 0);
                          g_clast_ok.store(cok ? 1 : 0);
                          g_clast_jitx.store(cdraw_data.jitter_x);
@@ -6152,6 +6200,9 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    // templog: view election snapshot + per-present deltas (log-only).
    int vpick = g_view_pick_snap.load(std::memory_order_relaxed);
    int vnpool = g_view_npool_snap.load(std::memory_order_relaxed);
+   int preads = g_clast_preads.load(std::memory_order_relaxed);
+   unsigned long long pskip = g_clast_pskip.load(std::memory_order_relaxed);
+   uint32_t pickck = g_view_pick_cksum.load(std::memory_order_relaxed);
    uint64_t rej = g_view_rejects.load(std::memory_order_relaxed);
    uint64_t prj = g_view_projrej.load(std::memory_order_relaxed);
    static uint64_t last_rej = 0, last_prj = 0;
@@ -6212,17 +6263,17 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    else
       snprintf(cvst, sizeof(cvst), "%d:%s%s%s", cvsrc, cvok ? "ok" : "fail:",
          cvok ? "" : (cvreason[0] ? cvreason : "unknown"));
-   // Worst-case growth of the new owng=/vfp= fields is ~80 chars; buffers
+   // Worst-case growth of the new view-filter fields is ~60 chars; buffers
    // sized so the margin over the true worst case stays >= 128 (snprintf
    // stays sizeof-bounded regardless -- no repeat of the old overflow).
-   char line[1280] = {};
+   char line[1408] = {};
    snprintf(line, sizeof(line),
-      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu cc=%llu",
+      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu cc=%llu",
       (unsigned long long)present, DG_BUILD_ID,
       (unsigned long long)draws, (unsigned long long)frozen,
       (unsigned long long)att, (unsigned long long)runs, (unsigned long long)resets,
       mvst, (unsigned)mvhash, mvfmt, mvsrc, mvcode, owng, vfc, vfp2, vfo, ok ? 1 : 0, rst ? 1 : 0, jx, jy, jd00, jd01, jd26, jd27, jdcx, jdcy, cvst, fmaster,
-      vpick, vnpool, (unsigned long long)drej, (unsigned long long)dproj, vp00, vp11, rotmag,
+      vpick, vnpool, preads, pskip, (unsigned)pickck, (unsigned long long)drej, (unsigned long long)dproj, vp00, vp11, rotmag,
       cown, cmsc, cmvsjit, cdec, cfx, cfy, csc, con, fovsl, fovtrue, (unsigned long long)fi, fibang,
       (unsigned long long)dage, (unsigned long long)ccv);
 #if TEST || DEVELOPMENT
@@ -6231,7 +6282,7 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    (void)hModule;
 #endif
    {
-      char rline[1344] = {};
+      char rline[1472] = {};
       snprintf(rline, sizeof(rline), "DaysGone FULL %s", line);
       reshade::log::message(reshade::log::level::info, rline);
    }
