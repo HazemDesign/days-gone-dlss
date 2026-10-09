@@ -28,7 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -4718,14 +4718,45 @@ public:
           g_cap_frames_left.fetch_sub(1, std::memory_order_relaxed);
 #endif
        // Pictures: copy-only backbuffer BMP, next 3 presents while armed.
+       // Bundle-hang guard: per-Present staging work stalls against an armed
+       // viewer blit (~150 copies/frame). Refuse while any viewer is armed
+       // (same condition as the blit gate); count down normally so the
+       // bundle still completes and prints BUNDLE done.
        if (g_pic_frames_left.load(std::memory_order_relaxed) > 0)
        {
-          WritePicFile(g_marker_module, native_device, frame);
+          if (g_cview_src.load(std::memory_order_relaxed) >= 0 ||
+              g_feedview.load(std::memory_order_relaxed) >= 0)
+             reshade::log::message(reshade::log::level::info,
+                "DaysGone PIC SKIP viewer-armed (turn viewers OFF first)");
+          else
+             WritePicFile(g_marker_module, native_device, frame);
           g_pic_frames_left.fetch_sub(1, std::memory_order_relaxed);
        }
        // All-passes: one pass BMP per present while armed (auto-disarms).
+       // Same viewer-armed refusal; advance replicates WritePassOne's tail
+       // so progress/disarm/BUNDLE-done behave identically.
        if (g_pass_active.load(std::memory_order_relaxed))
-          WritePassOne(g_marker_module, native_device, device_data, frame);
+       {
+          if (g_cview_src.load(std::memory_order_relaxed) >= 0 ||
+              g_feedview.load(std::memory_order_relaxed) >= 0)
+          {
+             reshade::log::message(reshade::log::level::info,
+                "DaysGone PIC SKIP viewer-armed (turn viewers OFF first)");
+             int pdone = g_pass_pos.fetch_add(1, std::memory_order_relaxed) + 1;
+             if (pdone >= kPassCount)
+             {
+                g_pass_active.store(false, std::memory_order_relaxed);
+                {
+                   std::lock_guard<std::mutex> plk(g_pass_slot_mutex);
+                   for (int i = 0; i < 6; i++)
+                      g_pass_slot[i].reset();
+                }
+                reshade::log::message(reshade::log::level::info, "DaysGone PIC passes done 19/19");
+             }
+          }
+          else
+             WritePassOne(g_marker_module, native_device, device_data, frame);
+       }
        // Full-trace: one summary line per present while armed; auto-OFF at 0.
        if (g_fulltrace.load(std::memory_order_relaxed) &&
            g_fulltrace_frames_left.load(std::memory_order_relaxed) > 0)
@@ -5359,7 +5390,7 @@ public:
               ImGui::Text("SAVING PICTURES... %d presents left", pic_left);
            else if (ImGui::Button("Save 3 pictures now"))
               g_pic_frames_left.store(3);
-           ImGui::TextWrapped("Writes Luma-DaysGone-pic-<present>.bmp + DaysGone PIC mirror in ReShade.log.");
+           ImGui::TextWrapped("Writes Luma-DaysGone-pic-<present>.bmp + DaysGone PIC mirror in ReShade.log (turn Viewers OFF first).");
            bool pass_on = g_pass_active.load(std::memory_order_relaxed);
            int pass_pos = g_pass_pos.load(std::memory_order_relaxed);
            if (pass_on)
@@ -5369,7 +5400,7 @@ public:
               g_pass_pos.store(0, std::memory_order_relaxed);
               g_pass_active.store(true, std::memory_order_relaxed);
            }
-           ImGui::TextWrapped("One BMP per debug pass (~19 presents): Luma-DaysGone-pass-<src>-<present>.bmp + DaysGone PIC mirror.");
+           ImGui::TextWrapped("One BMP per debug pass (~19 presents): Luma-DaysGone-pass-<src>-<present>.bmp + DaysGone PIC mirror (turn Viewers OFF first).");
            bool bundle_on = g_bundle_active.load(std::memory_order_relaxed);
            if (bundle_on)
            {
@@ -5412,7 +5443,7 @@ public:
               reshade::log::message(reshade::log::level::info,
                  "DaysGone BUNDLE start: pics + passes + cap + full-trace armed");
            }
-           ImGui::TextWrapped("Arms pics(3) + passes(19) + cap(3) + full-trace(N); 'DaysGone BUNDLE done ...' mirrors at the end.");
+           ImGui::TextWrapped("Arms pics(3) + passes(19) + cap(3) + full-trace(N); 'DaysGone BUNDLE done ...' mirrors at the end (turn Viewers OFF first).");
        }
     }
 };
@@ -6007,7 +6038,17 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    int cvsrc = g_cview_stash_src.load(std::memory_order_relaxed);
    int cvok = g_cview_stash_ok.load(std::memory_order_relaxed);
    char cvreason[96] = {};
-   { std::lock_guard<std::mutex> lk(g_cview_mutex); snprintf(cvreason, sizeof(cvreason), "%s", g_cview_stash_reason); }
+   // Bundle-hang guard: never block Present on a draw-thread mutex. If the
+   // stash lock is contested, emit the busy sentinel and continue; every
+   // other field below stays byte-identical.
+   bool cvbusy = false;
+   {
+      std::unique_lock<std::mutex> lk(g_cview_mutex, std::try_to_lock);
+      if (lk.owns_lock())
+         snprintf(cvreason, sizeof(cvreason), "%s", g_cview_stash_reason);
+      else
+         cvbusy = true;
+   }
    for (char* p = cvreason; *p; ++p) { if (*p == ' ' || *p == ':') *p = '_'; }
    int fmaster = g_freeze_master.load(std::memory_order_relaxed) ? 1 : 0;
    // real vs zero vs stale: stale = last MV was real but the compute slot has
@@ -6020,7 +6061,9 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
          mvst = "stale";
    }
    char cvst[128] = {};
-   if (cvok < 0)
+   if (cvbusy)
+      snprintf(cvst, sizeof(cvst), "-99:busy");
+   else if (cvok < 0)
       snprintf(cvst, sizeof(cvst), "%d:none", cvsrc);
    else
       snprintf(cvst, sizeof(cvst), "%d:%s%s%s", cvsrc, cvok ? "ok" : "fail:",
