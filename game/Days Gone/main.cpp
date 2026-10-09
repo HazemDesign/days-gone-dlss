@@ -28,7 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -1137,7 +1137,7 @@ struct CopyBlitScope
 static bool RunCopyPass(ID3D11Device* dev, ID3D11DeviceContext* ctx, DeviceData& device_data,
    DaysGoneDeviceData& gd, ID3D11ShaderResourceView* src_srv, ID3D11RenderTargetView* dst_rtv,
    uint32_t w, uint32_t h, bool swap_rb, bool srgb_encode, int view_chan = -1, bool keep_alpha = false,
-   bool alpha_one = false)
+   bool alpha_one = false, bool is_viewer = false)
 {
    ID3D11PixelShader* ps = nullptr;
    // M22: alpha_one (forced opaque scene copy) variants.
@@ -1204,10 +1204,12 @@ static bool RunCopyPass(ID3D11Device* dev, ID3D11DeviceContext* ctx, DeviceData&
    ctx->OMSetRenderTargets(1, &dst_rtv, nullptr);
    ctx->VSSetShader(vs, nullptr, 0);
    ctx->PSSetShader(ps, nullptr, 0);
-   // Viewer stretch-to-fill (display only): target dims for the View shader
-   // so a half-res source fills the whole target. Other copy paths use no
-   // cbuffer and are untouched.
-   bool use_viewcb = (view_chan >= 0);
+   // Viewer stretch-to-fill (display only): target dims for the View/Copy
+   // shader so a half-res source fills the whole target. Bound on every
+   // viewer blit regardless of channel (ALL=-1 uses the Copy PS, which now
+   // scales too). Non-viewer copy paths pass is_viewer=false and bind no
+   // cbuffer -- byte-for-byte old behavior there.
+   bool use_viewcb = (view_chan >= 0 || is_viewer);
    if (use_viewcb)
    {
       if (!gd.cb_viewscale)
@@ -3669,7 +3671,7 @@ public:
                                vdone = RunCopyPass(native_device, native_device_context, device_data, gd0,
                                   vsrc0, vrtv, vw, vh,
                                   g_swap_output.load(std::memory_order_relaxed), false,
-                                  ViewChanForBlit(g_view_chan.load(std::memory_order_relaxed)));
+                                  ViewChanForBlit(g_view_chan.load(std::memory_order_relaxed)), false, false, true);
                            vrtv->Release();
                         }
                         if (vdone)
@@ -4695,7 +4697,7 @@ public:
                           vdone2 = RunCopyPass(native_device, native_device_context, device_data, gdview,
                              vsrc.get(), wrtv2, vd2.Width, vd2.Height,
                              g_swap_output.load(std::memory_order_relaxed), false,
-                             ViewChanForBlit(g_view_chan.load(std::memory_order_relaxed)));
+                             ViewChanForBlit(g_view_chan.load(std::memory_order_relaxed)), false, false, true);
                          if (vdone2)
                          {
                             g_cview_blits.fetch_add(1, std::memory_order_relaxed);

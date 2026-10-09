@@ -3,12 +3,19 @@
 // data. SRGB_ENCODE replicates the native TAAU tail (sRGB piecewise encode
 // + min() quirk + w=0) so DLSS output matches what downstream expects.
 Texture2D<float4> DLSSOutputTex : register(t0);
+cbuffer ViewScale : register(b0)
+{
+    float2 TargetWH; // viewer target size (viewport px); stretch-to-fill debug view
+};
 
 float4 main(float4 pos : SV_Position) : SV_Target0
 {
    uint w, h;
    DLSSOutputTex.GetDimensions(w, h);
-   uint2 xy = min((uint2)pos.xy, uint2(w, h) - 1);
+   float2 src = float2((float)w, (float)h);
+   // Display-only stretch-to-fill: 1:1 legacy when TargetWH unset.
+   float2 tgt = (TargetWH.x > 0.5 && TargetWH.y > 0.5) ? TargetWH : src;
+   uint2 xy = (uint2)min(pos.xy * src / tgt, src - 1.0);
    float4 c = DLSSOutputTex.Load(int3(xy, 0));
 #if SWAP_RB
    c = c.bgra;
