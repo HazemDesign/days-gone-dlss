@@ -28,7 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -327,6 +327,12 @@ static std::atomic<int> g_clast_rw{ 0 }, g_clast_rh{ 0 }, g_clast_ow{ 0 }, g_cla
 static std::atomic<int> g_clast_mvfmt{ -1 }, g_clast_code{ 0 };
 static std::atomic<uint32_t> g_clast_mvhash{ 0 };
 static std::atomic<int> g_clast_mvreal{ 0 }, g_clast_reset{ 0 }, g_clast_ok{ 0 };
+// FED MV identity (log-only): which MV buffer NGX actually ate this present.
+// g_clast_code already holds c_mv_code; mvcode mirrors it for the FULL line,
+// mvsrc holds the c_mv_src label, mvselframe the lookup frame (-1 = no pick).
+static std::atomic<int> g_clast_mvcode{ 0 };
+static std::atomic<long long> g_clast_mvselframe{ -1 };
+static char g_clast_mvsrc[32] = {};
 static std::atomic<float> g_clast_jitx{ 0.0f }, g_clast_jity{ 0.0f };
 // M11 one-shot compute-slot tools (masterless): I/O logger + CB0 dumper.
 static std::atomic<bool> g_clog_slot{ false };
@@ -2854,6 +2860,7 @@ public:
                       // M27: resolve which velocity buffer feeds DLSS.
                       ID3D11Resource* mv_sel = nullptr;
                       const char* mv_sel_name = "cache";
+                      long long mv_sel_frame = -1; // lookup frame of the pick (log-only)
                       {
                          int mvmode = g_mv_src_mode.load(std::memory_order_relaxed);
                          if (mvmode >= 1 && mvmode <= 6)
@@ -2862,10 +2869,10 @@ public:
                             std::lock_guard<std::mutex> mlk(g_mvmap_mutex);
                             auto it = g_mv_by_hash.find(want);
                             if (it != g_mv_by_hash.end() && it->second.frame == g_hist_frame.load(std::memory_order_relaxed) && it->second.res)
-                            { mv_sel = it->second.res.get(); mv_sel_name = kMvNames[mvmode - 1]; c_mv_code = 3; }
+                            { mv_sel = it->second.res.get(); mv_sel_name = kMvNames[mvmode - 1]; c_mv_code = 3; mv_sel_frame = (long long)it->second.frame; }
                          }
                          else if (gd.cached_mvs && gd.cached_mvs_frame == g_hist_frame.load(std::memory_order_relaxed))
-                         { mv_sel = gd.cached_mvs.get(); mv_sel_name = "cache"; c_mv_code = 1; }
+                         { mv_sel = gd.cached_mvs.get(); mv_sel_name = "cache"; c_mv_code = 1; mv_sel_frame = (long long)gd.cached_mvs_frame; }
                       }
                       // M47: own rotation-exact camera MVs (stash-fed). Takes
                       // priority when enabled with consecutive cur+prev stash;
@@ -3312,6 +3319,10 @@ public:
                          g_clast_mvfmt.store(mvfmt); g_clast_code.store(c_mv_code);
                          g_clast_mvhash.store(gd.cached_mvs_hash);
                          g_clast_mvreal.store(c_mv_real ? 1 : 0);
+                         // FED MV identity tap (log-only, relaxed like the rest).
+                         g_clast_mvcode.store(c_mv_code, std::memory_order_relaxed);
+                         snprintf(g_clast_mvsrc, sizeof(g_clast_mvsrc), "%s", c_mv_src ? c_mv_src : "?");
+                         g_clast_mvselframe.store(mv_sel ? mv_sel_frame : -1, std::memory_order_relaxed);
                          g_clast_reset.store(creset ? 1 : 0);
                          g_clast_ok.store(cok ? 1 : 0);
                          g_clast_jitx.store(cdraw_data.jitter_x);
@@ -5927,6 +5938,9 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    int mvreal = g_clast_mvreal.load(std::memory_order_relaxed);
    uint32_t mvhash = g_clast_mvhash.load(std::memory_order_relaxed);
    int mvfmt = g_clast_mvfmt.load(std::memory_order_relaxed);
+   int mvcode = g_clast_mvcode.load(std::memory_order_relaxed);
+   char mvsrc[32] = {};
+   snprintf(mvsrc, sizeof(mvsrc), "%s", g_clast_mvsrc);
    int ok = g_clast_ok.load(std::memory_order_relaxed);
    int rst = g_clast_reset.load(std::memory_order_relaxed);
    float jx = g_clast_jitx.load(std::memory_order_relaxed);
@@ -5988,13 +6002,13 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    else
       snprintf(cvst, sizeof(cvst), "%d:%s%s%s", cvsrc, cvok ? "ok" : "fail:",
          cvok ? "" : (cvreason[0] ? cvreason : "unknown"));
-   char line[768] = {};
+   char line[832] = {};
    snprintf(line, sizeof(line),
-      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu cc=%llu",
+      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu cc=%llu",
       (unsigned long long)present, DG_BUILD_ID,
       (unsigned long long)draws, (unsigned long long)frozen,
       (unsigned long long)att, (unsigned long long)runs, (unsigned long long)resets,
-      mvst, (unsigned)mvhash, mvfmt, ok ? 1 : 0, rst ? 1 : 0, jx, jy, jd00, jd01, jd26, jd27, jdcx, jdcy, cvst, fmaster,
+      mvst, (unsigned)mvhash, mvfmt, mvsrc, mvcode, ok ? 1 : 0, rst ? 1 : 0, jx, jy, jd00, jd01, jd26, jd27, jdcx, jdcy, cvst, fmaster,
       vpick, vnpool, (unsigned long long)drej, (unsigned long long)dproj, vp00, vp11, rotmag,
       cown, cmsc, cmvsjit, cdec, cfx, cfy, csc, con, fovsl, fovtrue, (unsigned long long)fi, fibang,
       (unsigned long long)dage, (unsigned long long)ccv);
@@ -6004,7 +6018,7 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    (void)hModule;
 #endif
    {
-      char rline[800] = {};
+      char rline[896] = {};
       snprintf(rline, sizeof(rline), "DaysGone FULL %s", line);
       reshade::log::message(reshade::log::level::info, rline);
    }
