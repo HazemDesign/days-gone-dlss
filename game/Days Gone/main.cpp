@@ -28,7 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -197,6 +197,12 @@ struct DaysGoneDeviceData : public GameDeviceData
     int view_reanchor_run = 0; // straight frames with zero jd passers (cut)
     float view_chal_p00 = 0.0f, view_chal_p11 = 0.0f; // challenger signature
     float view_chal_r[16] = {}; // challenger R signature
+    // projhold: cross-frame projection-hold escape state. While a held
+    // challenger projection stays stable, count straight frames; re-anchor
+    // after 5 (same 5-count style as the rotation re-anchor). Oscillation
+    // never stabilizes, so it never re-anchors; real zoom/cuts do.
+    float view_hold_p00 = 0.0f, view_hold_p11 = 0.0f;
+    int view_hold_run = 0;
     ComPtr<ID3D11Buffer> cb_ownmv; // M47 144B / M51 192B (R+T+Proj+Res+Near)
     ComPtr<ID3D11Buffer> cb_viewscale; // viewer TargetWH (16B, display-only stretch-to-fill)
 #endif
@@ -456,6 +462,56 @@ static void ElectViewPick(DaysGoneDeviceData& god, uint64_t frame)
       for (int i = 1; i < god.view_npool; i++)
          if (god.view_pool[i].hits > god.view_pool[best].hits) best = i;
       const auto& w = god.view_pool[best];
+      if (god.view_frame_cur != 0)
+      {
+         // projhold: cross-frame check vs COMMITTED with the same tolerance
+         // the within-frame gate uses. Rotation continuous + projection
+         // jumped discretely = mismatched-view alternation: HOLD the commit
+         // entirely (no cur->prev shift, no restamp, pair stays live) and
+         // count a projection rejection so FULL shows projrejD+ climbing.
+         // The own path then reuses the last good pair via its guard
+         // (pairing-fail owng=2 falls back to game MVs -- honest, never
+         // mismatched matrices with owng=0).
+         float c0 = god.view_c_p00, c1 = god.view_c_p11;
+         float ac0 = c0 < 0 ? -c0 : c0, ac1 = c1 < 0 ? -c1 : c1;
+         float tol0 = 0.015f * ac0 > 0.015f ? 0.015f * ac0 : 0.015f;
+         float tol1 = 0.015f * ac1 > 0.015f ? 0.015f * ac1 : 0.015f;
+         float jd = 0.0f;
+         for (int q = 0; q < 16; q++)
+         {
+            float dd = w.cb[32 + q] - god.view_cb_cur[32 + q];
+            if (dd < 0) dd = -dd;
+            if (dd > jd) jd = dd;
+         }
+         float d0 = w.p00 - c0; if (d0 < 0) d0 = -d0;
+         float d1 = w.p11 - c1; if (d1 < 0) d1 = -d1;
+         if (jd < 0.8f && (d0 > tol0 || d1 > tol1))
+         {
+            g_view_projrej.fetch_add(1, std::memory_order_relaxed);
+            g_agg_projrej.fetch_add(1, std::memory_order_relaxed);
+            // Escape hatch: a challenger projection STABLE across 5 straight
+            // frames (real zoom/cut) re-anchors to it.
+            float hd0 = w.p00 - god.view_hold_p00; if (hd0 < 0) hd0 = -hd0;
+            float hd1 = w.p11 - god.view_hold_p11; if (hd1 < 0) hd1 = -hd1;
+            if (god.view_hold_run > 0 && hd0 <= tol0 && hd1 <= tol1)
+               god.view_hold_run++;
+            else
+            {
+               god.view_hold_run = 1;
+               god.view_hold_p00 = w.p00;
+               god.view_hold_p11 = w.p11;
+            }
+            if (god.view_hold_run >= 5)
+            {
+               CommitViewPick(god, w.cb, w.p00, w.p11, frame, best);
+               god.view_hold_run = 0;
+            }
+            god.view_pick_run = 0;
+            god.view_reanchor_run = 0;
+            return;
+         }
+         god.view_hold_run = 0;
+      }
       CommitViewPick(god, w.cb, w.p00, w.p11, frame, best);
       god.view_pick_run = 0;
       god.view_reanchor_run = 0;
