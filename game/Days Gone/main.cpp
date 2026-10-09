@@ -34,7 +34,7 @@
 #define DG_HOTKEY_DLSS VK_F9
 #define DG_HOTKEY_TRACE VK_F10
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -865,6 +865,7 @@ static void GetMVScales(float rw, float rh, float& sx, float& sy)
    {
    case 1: sx = 0.5f * rw; sy = 0.5f * rh; break; // legacy M14 (double-scale)
    case 2: sx = 0.5f; sy = 0.5f; break;
+   case 3: sx = 2.0f; sy = 2.0f; break; // half-gain compensation test
    default: sx = 1.0f; sy = 1.0f; break; // M30 upstream parity
    }
 }
@@ -5363,9 +5364,9 @@ public:
 
        if (ImGui::CollapsingHeader("Motion tuning (advanced)"))
        {
-          const char* sc_names[] = { "1.0 pass-through (default)", "0.5*res (legacy)", "0.5" };
+          const char* sc_names[] = { "1.0 pass-through (default)", "0.5*res (legacy)", "0.5", "2.0 (half-gain compensation test)" };
           int sm = g_mv_scale_mode.load();
-          if (ImGui::Combo("MV scale mode", &sm, sc_names, 3))
+          if (ImGui::Combo("MV scale mode", &sm, sc_names, 4))
              g_mv_scale_mode.store(sm);
           const char* js_names[] = { "x1 (default)", "x2 (NDC)", "x0.5" };
           int jm = g_jit_scale_mode.load();
