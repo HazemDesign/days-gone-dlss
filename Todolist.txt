@@ -1,0 +1,20 @@
+Days Gone DLSS — Detailed To-Do List (UE 4.10 Bend, NO motion-blur slot)
+M1: Luma loads in DaysGone.exe (this skeleton: draw counter, draws.log, marker). No rendering changes.
+M2: Shader dump (Development-Release, auto_dump=true, custom_shaders off). Drive gameplay, collect TAA candidates + .cso sizes.
+M3: TAA+UI split. Confirm which of B146BBAE/104E65B1/3B21A41C/4D982586 is the real resolve:
+    - log RT handle + WxH + fmt per candidate draw (scene HDR intermediate vs swapchain).
+    - HUD-preserving disable: Skip ONLY the HDR scene draw (menu toggle in M1). UI draws use
+      different hashes and compose later to swapchain -> HUD stays. This ports the
+      community "TAA off without HUD loss" trick into the mod (Skip, not Engine.ini).
+    - Engine.ini cross-check: r.DefaultFeature.AntiAliasing=0 kills TAA+HUD path globally;
+      our Skip must be narrower than that.
+M4: Inputs at the TAA draw: color (HDR pre-tonemap, expect R11G11B10/R16G16B16F x2 history),
+    depth (standard, verify not reverse-Z via 0x218B-style disasm), velocity (UE MV decode,
+    verify R16G16 packing + jittered/un-jittered), jitter (projection CB m20/m21), exposure.
+M5: COPY passthrough at TAA slot (scene -> history -> post). Game survives, HUD intact = pipeline owned.
+M6: (skip temporal dummy — go straight to DLSS, UE path is well understood)
+M7: Wire Luma NGX DLSS DLAA (render==output, no resize). UseLumaNGX=true. Auto-exposure ON,
+    inverted_depth per findings, mip bias -1 while running.
+M8: First DLSS frame bound to TAA output. Log sr_type/instance/inputs/runs.
+M9: Fix MV/depth/jitter (ghosting, flicker), then Quality/Balanced (67%/58%), then Transformer E/F.
+Final: Scene -> DLSS (at TAA) -> post -> UI -> Present. UI never through DLSS.

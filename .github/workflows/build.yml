@@ -1,0 +1,155 @@
+﻿name: Build Days Gone Luma mod
+
+# Builds ONLY the Days Gone project (x64) on top of upstream Luma-Framework.
+# Trigger / watch / download from the GitHub CLI, e.g.:
+#   gh workflow run build.yml --ref main
+#   gh run watch
+#   gh run download <run-id> --name Package-Test-Release-x64
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "game/**"
+      - "shaders/**"
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      luma_ref:
+        description: "Luma-Framework ref to build against (branch/tag/SHA)"
+        required: false
+        default: "main"
+
+env:
+  LUMA_REF: ${{ inputs.luma_ref || 'main' }}
+  PROJECT: Days Gone
+
+jobs:
+  build:
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        # Development-Release: shader disassembly + draw/pipeline tracer for the
+        # M3 TAA hunt. Test-Release: fast passive/dump runs. Publishing-Release:
+        # clean user build (no asserts, no dumping).
+        config: [Development-Release, Test-Release, Publishing-Release]
+    steps:
+      - name: Checkout this repo (Days Gone overlay)
+        uses: actions/checkout@v4
+        with:
+          path: mod
+
+      - name: Checkout Luma-Framework
+        uses: actions/checkout@v4
+        with:
+          repository: Filoppi/Luma-Framework
+          ref: ${{ env.LUMA_REF }}
+          submodules: recursive
+          fetch-depth: 0
+          path: luma
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      # No vcpkg step: only Luma's optional DXP path needs it, and this mod
+      # doesn't use DXP (NGX-only), so integrating it is pure overhead.
+
+      - name: Inject Days Gone overlay into Luma checkout
+        shell: pwsh
+        run: pwsh -ExecutionPolicy Bypass -File mod\scripts\inject-game.ps1 -LumaRoot luma -OverlayRoot mod
+
+      - name: Resolve ReShade submodule SHA (cache key)
+        id: reshade-sha
+        shell: pwsh
+        run: |
+          $entry = (git -C luma submodule status -- Source/External/reshade) -split '\s+' | Where-Object { $_ }
+          $sha = ($entry | Where-Object { $_ -match '^[0-9a-f]{40}$' } | Select-Object -First 1)
+          if (-not $sha) { $sha = 'unknown' }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Restore cached ReShade runtime
+        id: reshade-cache
+        uses: actions/cache@v4
+        with:
+          # The ReShade build output is deterministic per submodule SHA +
+          # toolset, so rebuild only when upstream updates ReShade.
+          path: luma/Source/External/reshade/bin/x64/Release/ReShade64.dll
+          key: reshade64-${{ steps.reshade-sha.outputs.sha }}-v145
+
+      - name: Build ReShade.sln Release (x64 runtime for packaging)
+        if: steps.reshade-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          msbuild "luma\Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
+        continue-on-error: true
+
+      - name: Check ReShade runtime present
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'luma/Source/External/reshade/bin/x64/Release/ReShade64.dll')) {
+            Write-Host '::warning::ReShade64.dll missing (build failed or skipped) â€” package will ship without dxgi.dll; install ReShade 6.6.0+ manually.'
+          }
+
+      - name: Build Days Gone ${{ matrix.config }}-x64
+        shell: pwsh
+        run: |
+          $solutionDir = (Resolve-Path luma).Path + "\"
+          msbuild "luma\Source\Games\${{ env.PROJECT }}\${{ env.PROJECT }}.vcxproj" `
+            /p:Configuration="${{ matrix.config }}" `
+            /p:Platform="x64" `
+            /p:SolutionDir="$solutionDir" `
+            /p:DefineConstants="REMOTE_BUILD=1" `
+            /m /v:m
+
+      - name: Package addon + shaders + runtimes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          pwsh -ExecutionPolicy Bypass -File luma\Scripts\package.ps1 `
+            -Project "${{ env.PROJECT }}" `
+            -Config "${{ matrix.config }}" `
+            -Platform "x64" `
+            -OutDir "$((Resolve-Path artifacts).Path)"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Package-${{ matrix.config }}-x64
+          path: artifacts/Luma-*.zip
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Package-*
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: days-gone-latest-${{ github.run_number }}
+          name: Days Gone Luma mod (Build ${{ github.run_number }})
+          body: |
+            Days Gone Luma mod built against Luma-Framework `${{ env.LUMA_REF }}`.
+
+            Install:
+            - Extract the zip directly into the Days Gone executable folder
+              (next to DaysGone.exe), replacing previous files on update.
+            - Keep/overwrite dxgi.dll (ReShade) unless you proxy other mods through it.
+            - Boot the game, press Home for the ReShade/Luma menu.
+            - Status: Phase 2 skeleton (load-only, overlay + logging, no rendering
+              changes yet). See Todolist.txt milestones M1-M13.
+
+            Last commit: ${{ github.event.head_commit.message }}
+          files: Luma-*.zip
+

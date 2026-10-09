@@ -1,0 +1,17 @@
+# Local Luma checkout used by scripts\inject-game.ps1 (also used in CI)
+luma/
+# Build outputs
+Binaries/
+artifacts/
+out/
+broken-addon-backup/
+# VS / MSBuild noise
+.vs/
+*.user
+*.suo
+*.sdf
+# Packaged mods
+Luma-*.zip
+# OS noise
+Thumbs.db
+Desktop.ini
