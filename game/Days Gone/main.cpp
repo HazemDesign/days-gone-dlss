@@ -28,7 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -333,6 +333,12 @@ static std::atomic<int> g_clast_mvreal{ 0 }, g_clast_reset{ 0 }, g_clast_ok{ 0 }
 static std::atomic<int> g_clast_mvcode{ 0 };
 static std::atomic<long long> g_clast_mvselframe{ -1 };
 static char g_clast_mvsrc[32] = {};
+// Own-MV shake diagnostics (log-only): guard reason at the own use-points
+// (0=own-fed-ok, 1=election-hold, 2=prev/cur pairing fail, 3=projection shape
+// reject, 4=own-mode-off, 5=fell back to game MVs, 6=fell back to zero) plus
+// the M11 pairing triple (view_frame_cur/prev + oframe).
+static std::atomic<int> g_clast_ownguard{ 4 };
+static std::atomic<unsigned long long> g_clast_vfcur{ 0 }, g_clast_vfprev{ 0 }, g_clast_oframe{ 0 };
 static std::atomic<float> g_clast_jitx{ 0.0f }, g_clast_jity{ 0.0f };
 // M11 one-shot compute-slot tools (masterless): I/O logger + CB0 dumper.
 static std::atomic<bool> g_clog_slot{ false };
@@ -2899,6 +2905,10 @@ public:
                              auto& godc = *static_cast<DaysGoneDeviceData*>(device_data.game);
                              uint64_t oframe_c = g_hist_frame.load(std::memory_order_relaxed);
                              ElectViewPick(godc, oframe_c); // viewpick: elect+commit before use
+                             // Shake-diag pairing triple (log-only, M11 use-point).
+                             g_clast_vfcur.store((unsigned long long)godc.view_frame_cur, std::memory_order_relaxed);
+                             g_clast_vfprev.store((unsigned long long)godc.view_frame_prev, std::memory_order_relaxed);
+                             g_clast_oframe.store((unsigned long long)oframe_c, std::memory_order_relaxed);
                              if (godc.view_frame_cur == oframe_c && godc.view_frame_prev != 0 &&
                                 godc.view_frame_prev + 1 >= godc.view_frame_cur)
                             {
@@ -3018,17 +3028,29 @@ public:
                                          c_mv_real = true;
                                          c_mv_src = (ownm_c == 2) ? "own-rot-neg" : (ownm_c == 3) ? "own-fullA" : (ownm_c == 4) ? "own-fullB" : "own-rot";
                                          c_mv_code = 4;
-                                        own_done_c = true;
-                                        g_own_p00.store(op00_c, std::memory_order_relaxed);
-                                        g_own_p11.store(op11_c, std::memory_order_relaxed);
-                                        g_own_used.store(ownm_c, std::memory_order_relaxed);
-                                     }
-                                  }
-                               }
-                            }
-                         }
-                      }
-                      if (!own_done_c && !g_zero_mv.load(std::memory_order_relaxed) &&
+                                         own_done_c = true;
+                                         g_clast_ownguard.store(0, std::memory_order_relaxed); // log-only: own-fed-ok
+                                         g_own_p00.store(op00_c, std::memory_order_relaxed);
+                                         g_own_p11.store(op11_c, std::memory_order_relaxed);
+                                         g_own_used.store(ownm_c, std::memory_order_relaxed);
+                                      }
+                                   }
+                                }
+                                else // log-only: projection shape reject
+                                   g_clast_ownguard.store(3, std::memory_order_relaxed);
+                             }
+                             else // log-only: election hold (1) vs pairing fail (2)
+                             {
+                                if (godc.view_frame_cur != oframe_c)
+                                   g_clast_ownguard.store(1, std::memory_order_relaxed);
+                                else
+                                   g_clast_ownguard.store(2, std::memory_order_relaxed);
+                             }
+                          }
+                          else // log-only: own-mode-off
+                             g_clast_ownguard.store(4, std::memory_order_relaxed);
+                       }
+                       if (!own_done_c && !g_zero_mv.load(std::memory_order_relaxed) &&
                           gd.cached_mvs && gd.cached_mvs_frame == g_hist_frame.load(std::memory_order_relaxed))
                       {
                          // M13: raw fmt35 cache, direct to NGX (61c1f1a proven).
@@ -3335,6 +3357,9 @@ public:
                          g_clast_mvcode.store(c_mv_code, std::memory_order_relaxed);
                          snprintf(g_clast_mvsrc, sizeof(g_clast_mvsrc), "%s", c_mv_src ? c_mv_src : "?");
                          g_clast_mvselframe.store(mv_sel ? mv_sel_frame : -1, std::memory_order_relaxed);
+                         // Own fallback outcome (log-only): game MVs (5) or zero (6).
+                         if (!own_done_c)
+                            g_clast_ownguard.store(c_mv_real ? 5 : 6, std::memory_order_relaxed);
                          g_clast_reset.store(creset ? 1 : 0);
                          g_clast_ok.store(cok ? 1 : 0);
                          g_clast_jitx.store(cdraw_data.jitter_x);
@@ -4186,14 +4211,26 @@ public:
                                         mv_real = true;
                                         mv_src = (ownm == 2) ? "own-rot-neg" : (ownm == 3) ? "own-fullA" : (ownm == 4) ? "own-fullB" : "own-rot";
                                         own_done = true;
+                                        g_clast_ownguard.store(0, std::memory_order_relaxed); // log-only: own-fed-ok
                                         g_own_p00.store(op00, std::memory_order_relaxed);
                                         g_own_p11.store(op11, std::memory_order_relaxed);
                                         g_own_used.store(ownm, std::memory_order_relaxed);
                                      }
                                   }
                                }
+                               else // log-only: projection shape reject
+                                  g_clast_ownguard.store(3, std::memory_order_relaxed);
+                            }
+                            else // log-only: election hold (1) vs pairing fail (2)
+                            {
+                               if (god.view_frame_cur != oframe)
+                                  g_clast_ownguard.store(1, std::memory_order_relaxed);
+                               else
+                                  g_clast_ownguard.store(2, std::memory_order_relaxed);
                             }
                          }
+                         else // log-only: own-mode-off
+                            g_clast_ownguard.store(4, std::memory_order_relaxed);
                       }
                       if (!own_done && !g_zero_mv.load(std::memory_order_relaxed))
                       {
@@ -4288,9 +4325,12 @@ public:
                                mv_real = true;
                                mv_src = mv_sel_name;
                             }
-                         }
-                      }
-                      draw_data.motion_vectors = mv_res;
+                          }
+                       }
+                       // log-only: fell back to game MVs (5) or zero (6)
+                       if (!own_done)
+                          g_clast_ownguard.store(mv_real ? 5 : 6, std::memory_order_relaxed);
+                       draw_data.motion_vectors = mv_res;
                       // M10i: no-depth diagnostic.
                       draw_data.depth_buffer = g_no_depth.load(std::memory_order_relaxed) ? nullptr : res_depth.get();
                      draw_data.render_width = rw;
@@ -5692,6 +5732,8 @@ static void WritePicRes(HMODULE hModule, ID3D11Device* dev, ID3D11DeviceContext*
       bool bgra = false;
       switch (d.Format)
       {
+      case DXGI_FORMAT_R8G8B8A8_TYPELESS: // fmt27: plain 8-bit RGBA (same 4B/px layout
+         k = K8; break;                   // as UNORM -- direct copy, no tonemap).
       case DXGI_FORMAT_R8G8B8A8_UNORM:
       case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: k = K8; break;
       case DXGI_FORMAT_B8G8R8A8_UNORM:
@@ -5993,6 +6035,10 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    uint32_t mvhash = g_clast_mvhash.load(std::memory_order_relaxed);
    int mvfmt = g_clast_mvfmt.load(std::memory_order_relaxed);
    int mvcode = g_clast_mvcode.load(std::memory_order_relaxed);
+   int owng = g_clast_ownguard.load(std::memory_order_relaxed);
+   unsigned long long vfc = g_clast_vfcur.load(std::memory_order_relaxed);
+   unsigned long long vfp2 = g_clast_vfprev.load(std::memory_order_relaxed);
+   unsigned long long vfo = g_clast_oframe.load(std::memory_order_relaxed);
    char mvsrc[32] = {};
    snprintf(mvsrc, sizeof(mvsrc), "%s", g_clast_mvsrc);
    int ok = g_clast_ok.load(std::memory_order_relaxed);
@@ -6068,13 +6114,16 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    else
       snprintf(cvst, sizeof(cvst), "%d:%s%s%s", cvsrc, cvok ? "ok" : "fail:",
          cvok ? "" : (cvreason[0] ? cvreason : "unknown"));
-   char line[832] = {};
+   // Worst-case growth of the new owng=/vfp= fields is ~80 chars; buffers
+   // sized so the margin over the true worst case stays >= 128 (snprintf
+   // stays sizeof-bounded regardless -- no repeat of the old overflow).
+   char line[1280] = {};
    snprintf(line, sizeof(line),
-      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu cc=%llu",
+      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu cc=%llu",
       (unsigned long long)present, DG_BUILD_ID,
       (unsigned long long)draws, (unsigned long long)frozen,
       (unsigned long long)att, (unsigned long long)runs, (unsigned long long)resets,
-      mvst, (unsigned)mvhash, mvfmt, mvsrc, mvcode, ok ? 1 : 0, rst ? 1 : 0, jx, jy, jd00, jd01, jd26, jd27, jdcx, jdcy, cvst, fmaster,
+      mvst, (unsigned)mvhash, mvfmt, mvsrc, mvcode, owng, vfc, vfp2, vfo, ok ? 1 : 0, rst ? 1 : 0, jx, jy, jd00, jd01, jd26, jd27, jdcx, jdcy, cvst, fmaster,
       vpick, vnpool, (unsigned long long)drej, (unsigned long long)dproj, vp00, vp11, rotmag,
       cown, cmsc, cmvsjit, cdec, cfx, cfy, csc, con, fovsl, fovtrue, (unsigned long long)fi, fibang,
       (unsigned long long)dage, (unsigned long long)ccv);
@@ -6084,7 +6133,7 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    (void)hModule;
 #endif
    {
-      char rline[896] = {};
+      char rline[1344] = {};
       snprintf(rline, sizeof(rline), "DaysGone FULL %s", line);
       reshade::log::message(reshade::log::level::info, rline);
    }
