@@ -28,7 +28,13 @@
 #include <unordered_set>
 #include <vector>
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale";
+// Hotkeys (#define-configurable here): F9 toggles the M11 DLSS master,
+// F10 starts a full-trace (same as the Tools-menu button). Edge-triggered
+// per present in OnPresent; every action mirrors to ReShade.log.
+#define DG_HOTKEY_DLSS VK_F9
+#define DG_HOTKEY_TRACE VK_F10
+
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -4811,6 +4817,38 @@ public:
       g_draws_last_frame.store(g_draws_this_frame.exchange(0, std::memory_order_relaxed));
       uint64_t frame = g_hist_frame.fetch_add(1, std::memory_order_relaxed) + 1;
       g_frozen_skipped_last_frame.store(g_frozen_skipped_this_frame.exchange(0, std::memory_order_relaxed));
+      // Hotkeys: minimal per-present edge-triggered check (no core keybind
+      // mechanism exists in this overlay). Mirrors the menu actions exactly.
+      {
+         static bool prev_dlss = false, prev_trace = false;
+         bool down_dlss = (GetAsyncKeyState(DG_HOTKEY_DLSS) & 0x8000) != 0;
+         bool down_trace = (GetAsyncKeyState(DG_HOTKEY_TRACE) & 0x8000) != 0;
+         if (down_dlss && !prev_dlss)
+         {
+            bool on = !g_cdlss_master.load(std::memory_order_relaxed);
+            g_cdlss_master.store(on);
+            device_data.force_reset_sr = true;
+#if ENABLE_SR
+            if (device_data.game)
+               static_cast<DaysGoneDeviceData*>(device_data.game)->first_cdlss_frame = true;
+#endif
+            char hb[64] = {};
+            snprintf(hb, sizeof(hb), "DaysGone HOTKEY dlss=%s", on ? "on" : "off");
+            reshade::log::message(reshade::log::level::info, hb);
+         }
+         if (down_trace && !prev_trace)
+         {
+            int ttn = g_fulltrace_n.load(std::memory_order_relaxed);
+            if (ttn < 1) ttn = 1;
+            g_fulltrace_frames_left.store(ttn, std::memory_order_relaxed);
+            g_fulltrace.store(true, std::memory_order_relaxed);
+            char hb[64] = {};
+            snprintf(hb, sizeof(hb), "DaysGone HOTKEY trace start %d", ttn);
+            reshade::log::message(reshade::log::level::info, hb);
+         }
+         prev_dlss = down_dlss;
+         prev_trace = down_trace;
+      }
 #if TEST || DEVELOPMENT
        if (g_cap_frames_left.load(std::memory_order_relaxed) > 0)
           g_cap_frames_left.fetch_sub(1, std::memory_order_relaxed);
@@ -5036,6 +5074,7 @@ public:
              static_cast<DaysGoneDeviceData*>(device_data.game)->first_cdlss_frame = true;
 #endif
        }
+       ImGui::Text("Hotkeys: F9 = M11 DLSS toggle, F10 = start full-trace (DG_HOTKEY_* defines at top of main.cpp).");
         if (g_dlss_master.load(std::memory_order_relaxed) && g_cdlss_master.load(std::memory_order_relaxed))
            ImGui::TextWrapped("Both ON -- M11 while the compute slot fires, M7 takes over when it goes silent 30+ presents (e.g. reduced render scale).");
        if (g_cdlss_master.load(std::memory_order_relaxed) && g_cdlss_attempts.load(std::memory_order_relaxed) == 0)
@@ -5466,6 +5505,7 @@ public:
               }
               if (ft)
                  ImGui::Text("FULL-TRACE ACTIVE: %d presents left (full.log + DaysGone FULL mirror)", left);
+              ImGui::Text("Hotkey: F10 starts full-trace with the N above.");
            }
            if (ImGui::Button("Sniff VS CBs for shared matrices (brief hitch)"))
            {
