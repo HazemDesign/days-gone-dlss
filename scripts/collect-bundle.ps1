@@ -10,7 +10,7 @@
 .EXAMPLE
     pwsh -ExecutionPolicy Bypass -File scripts\collect-bundle.ps1
     pwsh -ExecutionPolicy Bypass -File scripts\collect-bundle.ps1 -TailLines 800
-    pwsh -ExecutionPolicy Bypass -File scripts\collect-bundle.ps1 -GameDir "G:\Games\Days Gone\BendGame\Binaries\Win64"
+    pwsh -ExecutionPolicy Bypass -File scripts\collect-bundle.ps1 -GameDir "<SteamLibrary>\BendGame\Binaries\Win64"
     (or set $env:LUMA_DAYS_GONE_BIN_PATH to the folder containing DaysGone.exe
     instead of passing -GameDir every time)
 #>
@@ -35,7 +35,36 @@ New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 Write-Host "Bundle dir: $OutDir"
 
 if (-not (Test-Path $GameDir -PathType Container)) {
-    Write-Host "WARNING: GameDir not found: $GameDir (bundle will contain repo-side info only)."
+    Write-Host "WARNING: GameDir not found (bundle will contain repo-side info only)."
+}
+
+# Privacy: never write the absolute local game path or user profile into
+# bundles/shared text. Show only the last 3 game-dir segments
+# (e.g. "...\BendGame\Binaries\Win64"); redact $env:USERPROFILE as "~".
+$GameDirShown = $GameDir
+try {
+    $segs = @($GameDir -split '[\\/]' | Where-Object { $_ -ne '' })
+    if ($segs.Count -gt 3) { $GameDirShown = '...\' + ($segs[-3..-1] -join '\') }
+} catch { $GameDirShown = '(game dir redacted)' }
+
+function Redact-PrivatePaths {
+    param([string]$Text)
+    $out = $Text
+    try {
+        if (-not [string]::IsNullOrEmpty($env:USERPROFILE)) {
+            $out = $out -replace [regex]::Escape($env:USERPROFILE), '~'
+        }
+        if (-not [string]::IsNullOrEmpty($env:USERNAME)) {
+            $out = $out -replace [regex]::Escape($env:USERNAME), '<user>'
+        }
+    } catch { }
+    return $out
+}
+
+function Set-RedactedContent {
+    param([string]$Path, [string[]]$Lines)
+    $clean = @($Lines | ForEach-Object { Redact-PrivatePaths $_ })
+    Set-Content -Path $Path -Value $clean -Encoding utf8
 }
 
 function Copy-IfPresent {
@@ -72,7 +101,7 @@ if (Test-Path $frameSrc -PathType Leaf) {
         Write-Host ("frame.log is {0:N1} MB; bundled tail only + full skipped." -f ($size / 1MB))
     }
 } else {
-    "MISSING: $frameName not found in $GameDir" | Set-Content (Join-Path $OutDir $frameTailName) -Encoding utf8
+    "MISSING: $frameName not found (pass -GameDir explicitly)" | Set-Content (Join-Path $OutDir $frameTailName) -Encoding utf8
 }
 
 # --- 2b. full.log: last $TailLines always; full copy too if < 2MB ---
@@ -87,7 +116,7 @@ if (Test-Path $fullSrc -PathType Leaf) {
         Write-Host ("full.log is {0:N1} MB; bundled tail only + full skipped." -f ($size / 1MB))
     }
 } else {
-    "MISSING: $fullName not found in $GameDir (run Start full-trace in TEST/DEVELOPMENT config)" | Set-Content (Join-Path $OutDir $fullTailName) -Encoding utf8
+    "MISSING: $fullName not found (run Start full-trace in TEST/DEVELOPMENT config)" | Set-Content (Join-Path $OutDir $fullTailName) -Encoding utf8
 }
 
 # --- 3. ReShade.log: filtered view + raw tail; ReShade.ini as-is ---
@@ -95,18 +124,21 @@ $reshadeLog = Join-Path $GameDir "ReShade.log"
 $filterPattern = "DaysGone|cDLSS|cSTATS|cSCAN|cVIEW|capCS|AUDIT|FULL|FULLAGG"
 if (Test-Path $reshadeLog -PathType Leaf) {
     try {
-        Select-String -Path $reshadeLog -Pattern $filterPattern |
-            ForEach-Object { $_.Line } |
-            Set-Content (Join-Path $OutDir "ReShade-filtered.log") -Encoding utf8
+        $found = @(Select-String -Path $reshadeLog -Pattern $filterPattern |
+            ForEach-Object { $_.Line })
+        Set-RedactedContent (Join-Path $OutDir "ReShade-filtered.log") $found
     } catch {
-        "FILTER-FAILED: $_" | Set-Content (Join-Path $OutDir "ReShade-filtered.log") -Encoding utf8
+        "FILTER-FAILED" | Set-Content (Join-Path $OutDir "ReShade-filtered.log") -Encoding utf8
     }
-    Get-Tail $reshadeLog $TailLines | Set-Content (Join-Path $OutDir "ReShade-tail.log") -Encoding utf8
+    Set-RedactedContent (Join-Path $OutDir "ReShade-tail.log") (Get-Tail $reshadeLog $TailLines)
 } else {
-    "MISSING: ReShade.log not found in $GameDir" | Set-Content (Join-Path $OutDir "ReShade-tail.log") -Encoding utf8
-    "MISSING: ReShade.log not found in $GameDir" | Set-Content (Join-Path $OutDir "ReShade-filtered.log") -Encoding utf8
+    "MISSING: ReShade.log not found (pass -GameDir explicitly)" | Set-Content (Join-Path $OutDir "ReShade-tail.log") -Encoding utf8
+    "MISSING: ReShade.log not found (pass -GameDir explicitly)" | Set-Content (Join-Path $OutDir "ReShade-filtered.log") -Encoding utf8
 }
-Copy-IfPresent (Join-Path $GameDir "ReShade.ini") (Join-Path $OutDir "ReShade.ini") | Out-Null
+if (Test-Path (Join-Path $GameDir "ReShade.ini") -PathType Leaf) {
+    $iniLines = @(Get-Content (Join-Path $GameDir "ReShade.ini") -ErrorAction Stop)
+    Set-RedactedContent (Join-Path $OutDir "ReShade.ini") $iniLines
+}
 
 # --- 4. Addon version line from repo source ---
 $buildId = "(unknown)"
@@ -121,7 +153,7 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("Days Gone DLSS debug bundle")
 [void]$sb.AppendLine(("date=" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")))
 [void]$sb.AppendLine("build_id=$buildId")
-[void]$sb.AppendLine("game_dir=$GameDir")
+[void]$sb.AppendLine("game_dir=$GameDirShown")
 [void]$sb.AppendLine("")
 
 function Add-FileStats {
@@ -143,7 +175,7 @@ Add-FileStats "reshade" (Join-Path $GameDir "ReShade.log")
 # First-Draw cDLSS line: last match of "cDLSS first Draw".
 try {
     $fd = Select-String -Path $reshadeLog -Pattern "cDLSS first Draw" -ErrorAction Stop | Select-Object -Last 1
-    if ($fd) { [void]$sb.AppendLine(""); [void]$sb.AppendLine("first-Draw cDLSS:"); [void]$sb.AppendLine($fd.Line) }
+    if ($fd) { [void]$sb.AppendLine(""); [void]$sb.AppendLine("first-Draw cDLSS:"); [void]$sb.AppendLine((Redact-PrivatePaths $fd.Line)) }
     else { [void]$sb.AppendLine(""); [void]$sb.AppendLine("first-Draw cDLSS: (no match in ReShade.log)") }
 } catch {
     [void]$sb.AppendLine(""); [void]$sb.AppendLine("first-Draw cDLSS: (ReShade.log unavailable)")
@@ -182,7 +214,7 @@ try {
     $slotLines = @($lines | Where-Object { $_ -match "attempts|att=|runs=|resets=" } | Select-Object -Last 3)
     if ($slotLines.Count -gt 0) {
         [void]$sb.AppendLine("slot fire hints (last menu/counter lines):")
-        foreach ($l in $slotLines) { [void]$sb.AppendLine("  " + $l.Trim()) }
+        foreach ($l in $slotLines) { [void]$sb.AppendLine("  " + (Redact-PrivatePaths $l.Trim())) }
     } else {
         [void]$sb.AppendLine("slot fire hints: (no attempts/runs/resets lines in ReShade.log)")
     }

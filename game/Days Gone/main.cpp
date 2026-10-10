@@ -34,7 +34,7 @@
 #define DG_HOTKEY_DLSS VK_F9
 #define DG_HOTKEY_TRACE VK_F10
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid-menuclean-mvraw-tracefix-cleanup";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -215,7 +215,7 @@ struct DaysGoneDeviceData : public GameDeviceData
     // never stabilizes, so it never re-anchors; real zoom/cuts do.
     float view_hold_p00 = 0.0f, view_hold_p11 = 0.0f;
     int view_hold_run = 0;
-    ComPtr<ID3D11Buffer> cb_ownmv; // M47 144B / M51 192B (R+T+Proj+Res+Near)
+    ComPtr<ID3D11Buffer> cb_ownmv; // M47 144B / M51 192B / DeltaC 208B (R+T+Proj+Res+Near+dC)
     ComPtr<ID3D11Buffer> cb_viewscale; // viewer TargetWH (16B, display-only stretch-to-fill)
 #endif
 };
@@ -686,7 +686,10 @@ static std::atomic<uint64_t> g_cview_blits{ 0 };
 // gating as frame/draws logs). ReShade.log mirror runs in every config.
 static std::atomic<bool> g_fulltrace{ false };
 static std::atomic<int> g_fulltrace_frames_left{ 0 };
-static std::atomic<int> g_fulltrace_n{ 600 };
+// Tracefix: default 300 (~5s), hard clamp 30..300 at every arm site.
+// N=100000 meant ~28min of per-present file open/append/close + 1.4KB
+// ReShade mirror on the present thread (IO hitch + 100MB+ logs).
+static std::atomic<int> g_fulltrace_n{ 300 };
 // M59: exact NGX feeds, stored at Draw time (what DLSS actually got, named).
 // Slot viewers show bindings; these show the resolved inputs per path.
 static std::mutex g_feed_mutex;
@@ -867,25 +870,20 @@ static std::atomic<uint64_t> g_dlss_resets{ 0 }; // M57: M7 reset counter (M11 h
 static std::atomic<float> g_vert_fov{ 1.047f }; // M57: was hardcoded 60deg; proven view ~39.4deg=0.688
 static std::atomic<bool> g_m7stats{ false }; // M57: one-shot M7 pixel-input signal stats
 
-// M15: MV/jitter scale triage helpers (shared by both DLSS paths).
+// M15/M30: MV scale is 1.0 pass-through, always (upstream parity -- the MV
+// texture already holds zero-centered pixels; NVIDIA guide: "1.0 if motion
+// vectors do not need to be scaled"). Legacy modes 1 (0.5*res double-scale),
+// 2 (0.5), 3 (2.0 test) retired by cleanup: the menu combo is parked in the
+// Legacy header and g_mv_scale_mode stays defined for compat, but the feed
+// no longer reads it. Jitter scale likewise x1 always.
 static void GetMVScales(float rw, float rh, float& sx, float& sy)
 {
-   switch (g_mv_scale_mode.load(std::memory_order_relaxed))
-   {
-   case 1: sx = 0.5f * rw; sy = 0.5f * rh; break; // legacy M14 (double-scale)
-   case 2: sx = 0.5f; sy = 0.5f; break;
-   case 3: sx = 2.0f; sy = 2.0f; break; // half-gain compensation test
-   default: sx = 1.0f; sy = 1.0f; break; // M30 upstream parity
-   }
+   (void)rw; (void)rh;
+   sx = 1.0f; sy = 1.0f;
 }
 static float GetJitScale()
 {
-   switch (g_jit_scale_mode.load(std::memory_order_relaxed))
-   {
-   case 1: return 2.0f;
-   case 2: return 0.5f;
-   default: return 1.0f;
-   }
+   return 1.0f;
 }
 // M45: sr_type log trap -- upstream SR::Type is DLSS=0, FSR=1, None=-1
 // (super_resolution.h), so raw %d misreads DLSS as None. Always log the name.
@@ -1172,40 +1170,47 @@ static bool RunCopyPass(ID3D11Device* dev, ID3D11DeviceContext* ctx, DeviceData&
    uint32_t w, uint32_t h, bool swap_rb, bool srgb_encode, int view_chan = -1, bool keep_alpha = false,
    bool alpha_one = false, bool is_viewer = false)
 {
-   ID3D11PixelShader* ps = nullptr;
-   // M22: alpha_one (forced opaque scene copy) variants.
-   if (keep_alpha && alpha_one && swap_rb && srgb_encode)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone UI Encode BGRA AlphaOne PS")].get();
-   else if (keep_alpha && alpha_one && swap_rb)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone UI Copy BGRA AlphaOne PS")].get();
-   else if (keep_alpha && alpha_one && srgb_encode)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone UI Encode AlphaOne PS")].get();
-   else if (keep_alpha && alpha_one)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone UI Copy AlphaOne PS")].get();
-   else if (keep_alpha && swap_rb && srgb_encode)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone UI Encode BGRA PS")].get();
-   else if (keep_alpha && swap_rb)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone UI Copy BGRA PS")].get();
-   else if (keep_alpha && srgb_encode)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone UI Encode PS")].get();
-   else if (keep_alpha)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone UI Copy PS")].get();
+   // Cleanup: table-driven variant select (was 16x if-else; same keys, same
+   // priority: keep_alpha > alpha_one > view_chan > srgb > swap > default).
+   // Note view_chan only applies when !keep_alpha (as before). Keys are
+   // prehashed from literals (never a runtime string) so this compiles
+   // whether CompileTimeStringHash is constexpr-loop or array-template style.
+   static const uint32_t kKeepAlpha[2][2][2] = {
+      {
+         { CompileTimeStringHash("DaysGone UI Copy PS"), CompileTimeStringHash("DaysGone UI Encode PS") },
+         { CompileTimeStringHash("DaysGone UI Copy BGRA PS"), CompileTimeStringHash("DaysGone UI Encode BGRA PS") }
+      },
+      {
+         { CompileTimeStringHash("DaysGone UI Copy AlphaOne PS"), CompileTimeStringHash("DaysGone UI Encode AlphaOne PS") },
+         { CompileTimeStringHash("DaysGone UI Copy BGRA AlphaOne PS"), CompileTimeStringHash("DaysGone UI Encode BGRA AlphaOne PS") }
+      }
+   };
+   static const uint32_t kViewR = CompileTimeStringHash("DaysGone View R PS");
+   static const uint32_t kViewG = CompileTimeStringHash("DaysGone View G PS");
+   static const uint32_t kViewB = CompileTimeStringHash("DaysGone View B PS");
+   static const uint32_t kViewA = CompileTimeStringHash("DaysGone View A PS");
+   static const uint32_t kViewD = CompileTimeStringHash("DaysGone View DepthN PS");
+   static const uint32_t kSrgb = CompileTimeStringHash("DaysGone DLSS sRGB PS");
+   static const uint32_t kBgra = CompileTimeStringHash("DaysGone DLSS Copy BGRA PS");
+   static const uint32_t kCopy = CompileTimeStringHash("DaysGone DLSS Copy PS");
+   uint32_t copy_key = kCopy;
+   if (keep_alpha)
+      copy_key = kKeepAlpha[alpha_one ? 1 : 0][swap_rb ? 1 : 0][srgb_encode ? 1 : 0];
    else if (view_chan == 0)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone View R PS")].get();
+      copy_key = kViewR;
    else if (view_chan == 1)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone View G PS")].get();
+      copy_key = kViewG;
    else if (view_chan == 2)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone View B PS")].get();
-    else if (view_chan == 3)
-       ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone View A PS")].get();
-    else if (view_chan == 4)
-       ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone View DepthN PS")].get();
+      copy_key = kViewB;
+   else if (view_chan == 3)
+      copy_key = kViewA;
+   else if (view_chan == 4)
+      copy_key = kViewD;
    else if (srgb_encode)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone DLSS sRGB PS")].get();
+      copy_key = kSrgb;
    else if (swap_rb)
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone DLSS Copy BGRA PS")].get();
-   else
-      ps = device_data.native_pixel_shaders[CompileTimeStringHash("DaysGone DLSS Copy PS")].get();
+      copy_key = kBgra;
+   ID3D11PixelShader* ps = device_data.native_pixel_shaders[copy_key].get();
    ID3D11VertexShader* vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
    if (!ps || !vs || !src_srv || !dst_rtv || w == 0 || h == 0)
       return false;
@@ -3125,7 +3130,7 @@ public:
                                   if (!godc.cb_ownmv)
                                   {
                                       D3D11_BUFFER_DESC cbdc = {};
-                                      cbdc.ByteWidth = 192; // M51: R+T+Proj+Res+Near (48 floats)
+                                       cbdc.ByteWidth = 208; // M51 192B R+T+Proj+Res+Near (48 floats) + DeltaC float3+pad (4 floats)
                                      cbdc.Usage = D3D11_USAGE_DYNAMIC;
                                      cbdc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
                                      cbdc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -3163,6 +3168,13 @@ public:
                                          ofc[42] = (float)crw; ofc[43] = (float)crh;
                                          ofc[44] = 10.0f; // TRUE near, UE cm (NOT the NGX slider)
                                          ofc[45] = op00_prev_c; ofc[46] = op11_prev_c; ofc[47] = 0.0f;
+                                         // DeltaC (Full-B): Ccur-Cprev in DOUBLE on CPU --
+                                         // |C| is absolute-world hundreds+, float subtraction
+                                         // loses the small inter-frame delta (breaks at angles).
+                                         ofc[48] = (float)((double)vcur_c[172] - (double)vprv_c[172]);
+                                         ofc[49] = (float)((double)vcur_c[173] - (double)vprv_c[173]);
+                                         ofc[50] = (float)((double)vcur_c[174] - (double)vprv_c[174]);
+                                         ofc[51] = 0.0f;
                                         native_device_context->Unmap(godc.cb_ownmv.get(), 0);
                                         DrawStateStack<DrawStateStackType::FullGraphics> own_cs_c;
                                         own_cs_c.Cache(native_device_context, device_data.uav_max_count);
@@ -3231,21 +3243,9 @@ public:
                         // MVs; the core reads the native format correctly itself.
                         // M14: slot-t0 alternative (fmt27 may be the PROCESSED
                         // velocity the native TAA actually consumes).
-                        if (g_cmv_from_t0.load(std::memory_order_relaxed) && csrvs[0])
+                        // Cleanup: slot-t0 MV branch deleted (t0 proven HUD, flag
+                        // write-never). Decode chain below runs unconditionally.
                         {
-                           ID3D11Resource* tmp = nullptr;
-                           csrvs[0]->GetResource(&tmp);
-                            if (tmp)
-                            {
-                               c_mv_hold.attach(tmp);
-                               c_mv_res = tmp;
-                               c_mv_real = true;
-                               c_mv_src = "t0";
-                               c_mv_code = 2;
-                            }
-                        }
-                         else
-                         {
                             // M24/M30: decode to zero-centered pixels (upstream UE
                             // formula; shader variant follows the menu mode).
                             // Raw feed makes DLSS read the 0.5 center as a
@@ -3487,7 +3487,9 @@ public:
                         cdraw_data.source_color = c_color.get();
                         cdraw_data.output_color = gd.tex_dlss_out.get();
                         cdraw_data.motion_vectors = c_mv_res;
-                        cdraw_data.depth_buffer = g_no_depth.load(std::memory_order_relaxed) ? nullptr : c_depth.get();
+                        // Cleanup: g_no_depth branch retired (write-never flag;
+                        // core requires depth -- null depth guarantees Draw fail).
+                        cdraw_data.depth_buffer = c_depth.get();
                         cdraw_data.render_width = crw;
                         cdraw_data.render_height = crh;
                         cdraw_data.reset = creset;
@@ -3750,139 +3752,13 @@ public:
             // M10d standalone viewer + slot logger: works with sr_type None
             // (the old viewer sat INSIDE the sr_type!=None gate, so with SR
             // unset every source "showed" native = "none showed UI").
-            {
-               int vsel0 = g_view_src.load(std::memory_order_relaxed);
-               bool want_log = g_log_slot.exchange(false, std::memory_order_relaxed);
-               if (vsel0 >= 0 || want_log)
-               {
-                  bool is_imm0 = (native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE);
-                  ID3D11ShaderResourceView* r0[8] = {};
-                  native_device_context->PSGetShaderResources(0, 8, r0);
-                  auto desc_of = [](ID3D11ShaderResourceView* v, char* out, size_t n) {
-                     if (!v) { strcpy_s(out, n, "null"); return; }
-                     ID3D11Resource* tmp = nullptr;
-                     v->GetResource(&tmp);
-                     if (!tmp) { strcpy_s(out, n, "nores"); return; }
-                     ID3D11Texture2D* t = nullptr;
-                     if (SUCCEEDED(tmp->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t))) && t)
-                     {
-                        D3D11_TEXTURE2D_DESC d = {};
-                        t->GetDesc(&d);
-                        sprintf_s(out, n, "%ux%u f%d", d.Width, d.Height, (int)d.Format);
-                        t->Release();
-                     }
-                     else strcpy_s(out, n, "n2d");
-                     tmp->Release();
-                  };
-                  if (want_log)
-                  {
-                     char d0[48], d1[48], d2[48];
-                     desc_of(r0[0], d0, sizeof(d0));
-                     desc_of(r0[1], d1, sizeof(d1));
-                     desc_of(r0[2], d2, sizeof(d2));
-                     // Output dims too (menu 2560 vs game 1920 matters).
-                     char dout[48] = "null";
-                     ID3D11RenderTargetView* lrtv = nullptr;
-                     native_device_context->OMGetRenderTargets(1, &lrtv, nullptr);
-                     if (lrtv)
-                     {
-                        ID3D11Resource* lt = nullptr;
-                        lrtv->GetResource(&lt);
-                        if (lt)
-                        {
-                           ID3D11Texture2D* lx = nullptr;
-                           if (SUCCEEDED(lt->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&lx))) && lx)
-                           {
-                              D3D11_TEXTURE2D_DESC ld = {};
-                              lx->GetDesc(&ld);
-                              sprintf_s(dout, "out=%ux%u f%d", ld.Width, ld.Height, (int)ld.Format);
-                              lx->Release();
-                           }
-                           lt->Release();
-                        }
-                        lrtv->Release();
-                     }
-                     char b[256];
-                     snprintf(b, sizeof(b), "DaysGone slot 000573B8 t0=%s t1=%s t2=%s %s", d0, d1, d2, dout);
-                     reshade::log::message(reshade::log::level::info, b);
-                  }
-                  if (vsel0 >= 0 && is_imm0 && device_data.game)
-                  {
-                     auto& gd0 = *static_cast<DaysGoneDeviceData*>(device_data.game);
-                     ID3D11ShaderResourceView* vsrc0 = nullptr;
-                     ComPtr<ID3D11ShaderResourceView> vown0;
-                     if (vsel0 >= 0 && vsel0 <= 7)
-                        vsrc0 = r0[vsel0];
-                     else if (vsel0 == 8 && gd0.cached_depth)
-                     {
-                        D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
-                        vd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-                        vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                        vd.Texture2D.MipLevels = 1;
-                        if (SUCCEEDED(native_device->CreateShaderResourceView(gd0.cached_depth.get(), &vd, vown0.put())))
-                           vsrc0 = vown0.get();
-                     }
-                     else if (vsel0 == 9 && gd0.cached_mvs)
-                     {
-                        if (CreateViewSRV(native_device, gd0.cached_mvs.get(), vown0))
-                           vsrc0 = vown0.get();
-                     }
-                      else if (vsel0 == 10 && gd0.srv_color_in)
-                         vsrc0 = gd0.srv_color_in.get();
-                      else if (vsel0 == 11 && gd0.srv_dlss_out)
-                         vsrc0 = gd0.srv_dlss_out.get();
-                      // M56: exact NGX inputs (shimmer hunt while moving).
-                      else if (vsel0 == 12 && gd0.cached_hdr)
-                      {
-                         if (CreateViewSRV(native_device, gd0.cached_hdr.get(), vown0))
-                            vsrc0 = vown0.get();
-                      }
-                      else if (vsel0 == 13 && gd0.srv_mvs_conv)
-                         vsrc0 = gd0.srv_mvs_conv.get();
-                     if (vsrc0)
-                     {
-                        ID3D11RenderTargetView* vrtv = nullptr;
-                        native_device_context->OMGetRenderTargets(1, &vrtv, nullptr);
-                        bool vdone = false;
-                        if (vrtv)
-                        {
-                           ID3D11Resource* vt = nullptr;
-                           vrtv->GetResource(&vt);
-                           uint32_t vw = 0, vh = 0;
-                           if (vt)
-                           {
-                              ID3D11Texture2D* vx = nullptr;
-                              if (SUCCEEDED(vt->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&vx))) && vx)
-                              {
-                                 D3D11_TEXTURE2D_DESC vd2 = {};
-                                 vx->GetDesc(&vd2);
-                                 vw = vd2.Width; vh = vd2.Height;
-                                 vx->Release();
-                              }
-                              vt->Release();
-                           }
-                           // PLAIN (no sRGB) when viewing: the old path always
-                           // encoded, washing LDR UI into white.
-                            if (vw && vh)
-                               vdone = RunCopyPass(native_device, native_device_context, device_data, gd0,
-                                  vsrc0, vrtv, vw, vh,
-                                  g_swap_output.load(std::memory_order_relaxed), false,
-                                  ViewChanForBlit(g_view_chan.load(std::memory_order_relaxed)), false, false, true);
-                           vrtv->Release();
-                        }
-                        if (vdone)
-                        {
-                           for (int i = 0; i < 8; i++) if (r0[i]) r0[i]->Release();
-                           g_dlss_runs.fetch_add(1, std::memory_order_relaxed);
-                           if (g_mark_sr.load(std::memory_order_relaxed))
-                              device_data.has_drawn_sr = true;
-                           return DrawOrDispatchOverrideType::Skip;
-                        }
-                     }
-                  }
-                  for (int i = 0; i < 8; i++) if (r0[i]) r0[i]->Release();
-               }
-            }
+            // Cleanup: pixel viewer/logger block retired (menu-unreachable since
+            // menuclean -- g_view_src/g_log_slot have no stores, so vsel0 is
+            // always -1 and want_log always false; the slot-dims logger and
+            // 15-source viewer never fired). Compute viewer (g_cview_src) +
+            // feed viewer (g_feedview) + one channel combo cover diagnosis.
+            // Globals stay defined for compat; the M7 master gate below and
+            // the DLSS path are untouched.
              // Viewer/logger above run masterless; DLSS below stays gated.
              if (!g_dlss_master.load(std::memory_order_relaxed))
                 return DrawOrDispatchOverrideType::None;
@@ -4056,7 +3932,9 @@ public:
                    // Menu/map UI modes at render==output are handled by the
                    // t0 composite (M10d, on by default).
                    bool is_downscale = (ow < rw || oh < rh);
-                   bool blocked_by_guard = g_require_upscale.load(std::memory_order_relaxed) && (ow <= rw || oh <= rh);
+                   // Cleanup: upscale-only guard retired (write-never flag;
+                   // DLAA render==output is the M7 goal, guard made it a no-op).
+                   bool blocked_by_guard = false;
                    if (inputs_ok && (is_downscale || blocked_by_guard))
                    {
                       static bool logged_no_upscale = false;
@@ -4137,20 +4015,8 @@ public:
                            }
                         }
                      }
-                     // M9d bypass: show unpacked input, skip NGX entirely.
-                     // M9e: via RunCopyPass (forced clean state).
-                     if (g_dlss_bypass.load(std::memory_order_relaxed) && gd.tex_color_in && rtv)
-                     {
-                        if (RunCopyPass(native_device, native_device_context, device_data, gd,
-                            gd.srv_color_in.get(), rtv.get(), ow, oh,
-                            g_swap_output.load(std::memory_order_relaxed), !g_plain_output.load(std::memory_order_relaxed)))
-                        {
-                           g_dlss_runs.fetch_add(1, std::memory_order_relaxed);
-                           if (g_mark_sr.load(std::memory_order_relaxed))
-                              device_data.has_drawn_sr = true;
-                           return DrawOrDispatchOverrideType::Skip;
-                        }
-                     }
+                     // Cleanup: M9d bypass branch retired (write-never flag;
+                     // show-input diagnostic superseded by the feed viewer).
                      // M9i: prefer cached linear HDR (unambiguous RGB in every
                      // mode) over the mode-dependent fmt24 pair. Decided here
                      // so render dims + hdr flag agree downstream.
@@ -4289,17 +4155,9 @@ public:
                                   if (SUCCEEDED(native_device_context->Map(gd.staging_cb.get(), 0, D3D11_MAP_READ, 0, &m)) && m.pData)
                                   {
                                      const float* f = (const float*)m.pData;
-                                     // M10f: full CB dump (one-shot) -- find the real jitter.
-                                     if (g_dump_cb.exchange(false, std::memory_order_relaxed))
-                                     {
-                                        char b[1024];
-                                        int pos = snprintf(b, sizeof(b), "DaysGone slot CB0 dump (%u bytes):", bd.ByteWidth);
-                                        int nf = bd.ByteWidth / 4;
-                                        if (nf > 64) nf = 64;
-                                        for (int i = 0; i < nf && pos < (int)sizeof(b) - 32; i++)
-                                           pos += snprintf(b + pos, sizeof(b) - pos, " [%d]%.5f", i, f[i]);
-                                        reshade::log::message(reshade::log::level::info, b);
-                                     }
+                                     // Cleanup: M10f full-CB one-shot dump retired
+                                     // (g_dump_cb has no stores since menuclean;
+                                     // compute-side g_cdump_cb covers CB triage).
                                      // M10h: real jitter = cb0[26]/[27] (1-2px, from CB dump).
                                      // cb0[0]/[1] = dither offset (hundreds of px) -- logged only.
                                      g_jit_rawx.store(f[26]);
@@ -4393,7 +4251,7 @@ public:
                                   if (!god.cb_ownmv)
                                   {
                                      D3D11_BUFFER_DESC cbd = {};
-                                     cbd.ByteWidth = 192;
+                                      cbd.ByteWidth = 208; // M51 192B + DeltaC float3+pad (52 floats)
                                      cbd.Usage = D3D11_USAGE_DYNAMIC;
                                      cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
                                      cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -4428,6 +4286,11 @@ public:
                                         of[40] = op00; of[41] = op11;
                                         of[42] = (float)rw; of[43] = (float)rh;
                                         of[44] = 10.0f; of[45] = op00_prev; of[46] = op11_prev; of[47] = 0.0f;
+                                        // DeltaC (Full-B): Ccur-Cprev in DOUBLE on CPU (see compute site).
+                                        of[48] = (float)((double)vcur[172] - (double)vprv[172]);
+                                        of[49] = (float)((double)vcur[173] - (double)vprv[173]);
+                                        of[50] = (float)((double)vcur[174] - (double)vprv[174]);
+                                        of[51] = 0.0f;
                                         native_device_context->Unmap(god.cb_ownmv.get(), 0);
                                         DrawStateStack<DrawStateStackType::FullGraphics> own_cs;
                                         own_cs.Cache(native_device_context, device_data.uav_max_count);
@@ -4585,8 +4448,8 @@ public:
                        if (!own_done)
                           g_clast_ownguard.store(mv_real ? 5 : 6, std::memory_order_relaxed);
                        draw_data.motion_vectors = mv_res;
-                      // M10i: no-depth diagnostic.
-                      draw_data.depth_buffer = g_no_depth.load(std::memory_order_relaxed) ? nullptr : res_depth.get();
+                       // Cleanup: g_no_depth branch retired (write-never flag).
+                       draw_data.depth_buffer = res_depth.get();
                      draw_data.render_width = rw;
                      draw_data.render_height = rh;
                      draw_data.reset = reset;
@@ -4595,7 +4458,8 @@ public:
                       draw_data.vert_fov = g_vert_fov.load(std::memory_order_relaxed);
                      draw_data.jitter_x = 0.0f; // replaced below (M10)
                      draw_data.jitter_y = 0.0f;
-                      if (g_jitter_on.load(std::memory_order_relaxed) && !g_jitter_off.load(std::memory_order_relaxed))
+                      // Cleanup: g_jitter_off conjunct retired (write-never flag).
+                      if (g_jitter_on.load(std::memory_order_relaxed))
                       {
                         float pjs = GetJitScale();
                         draw_data.jitter_x = (g_jit_flip_x.load(std::memory_order_relaxed) ? 1.0f : -1.0f) * jit_x * pjs;
@@ -4641,37 +4505,10 @@ public:
                             g_mv_decode.load(std::memory_order_relaxed), g_mv_scale_mode.load(std::memory_order_relaxed), (int)g_inverted_depth.load(std::memory_order_relaxed), (int)hdr_feed);
                          reshade::log::message(reshade::log::level::info, b);
                       }
-                      // M56: one-shot M7 feed identity (stale-input hunt while moving).
-                      if (g_m7feed.exchange(false, std::memory_order_relaxed))
-                      {
-                         char fcb[64] = {}, fdb[64] = {}, fmb[64] = {};
-                         DescribeResHandle(dlss_color, fcb, sizeof(fcb));
-                         DescribeResHandle(res_depth.get(), fdb, sizeof(fdb));
-                         DescribeResHandle(mv_res, fmb, sizeof(fmb));
-                         uint64_t fframe = g_hist_frame.load(std::memory_order_relaxed);
-                         char fl[512];
-                         snprintf(fl, sizeof(fl),
-                            "DaysGone M7 feed frame=%llu color=%s@%llu depth=%s@%llu mv=%s(%s)@%llu hdr=%d",
-                            (unsigned long long)fframe,
-                            fcb, (unsigned long long)WriterFrame(dlss_color),
-                            fdb, (unsigned long long)WriterFrame(res_depth.get()),
-                            fmb, mv_src, (unsigned long long)WriterFrame(mv_res), (int)hdr_feed);
-                         reshade::log::message(reshade::log::level::info, fl);
-                      }
-                      // M57: M7 signal stats (mirrors cSTATS for the 50% path).
-                      if (g_m7stats.exchange(false, std::memory_order_relaxed))
-                      {
-                         LogResStats(native_device, native_device_context, dlss_color, "m7-color");
-                         LogResStats(native_device, native_device_context, res_depth.get(), "m7-depth");
-                         LogResStats(native_device, native_device_context, mv_res, "m7-mvfeed");
-                         if (gd.srv_dlss_out)
-                         {
-                            ID3D11Resource* dor7 = nullptr;
-                            gd.srv_dlss_out->GetResource(&dor7);
-                            LogResStats(native_device, native_device_context, dor7, "m7-dlss-out");
-                            if (dor7) dor7->Release();
-                         }
-                      }
+                      // Cleanup: M56 M7 feed-identity + M57 M7 stats one-shots
+                      // retired (g_m7feed/g_m7stats have no stores since
+                      // menuclean; shared AUDIT + compute cSTATS below cover
+                      // both paths).
                       // M57: audit every requested feed (both paths share the sequence).
                       {
                          int mvfmtA = -1;
@@ -5028,13 +4865,26 @@ public:
          }
          if (down_trace && !prev_trace)
          {
-            int ttn = g_fulltrace_n.load(std::memory_order_relaxed);
-            if (ttn < 1) ttn = 1;
-            g_fulltrace_frames_left.store(ttn, std::memory_order_relaxed);
-            g_fulltrace.store(true, std::memory_order_relaxed);
-            char hb[64] = {};
-            snprintf(hb, sizeof(hb), "DaysGone HOTKEY trace start %d", ttn);
-            reshade::log::message(reshade::log::level::info, hb);
+            // Tracefix: never re-arm while running; never arm with viewers on
+            // (same gate as the bundle buttons); clamp N to 30..300.
+            if (g_fulltrace_frames_left.load(std::memory_order_relaxed) > 0)
+               reshade::log::message(reshade::log::level::info, "DaysGone HOTKEY trace already running");
+            else if (g_view_src.load(std::memory_order_relaxed) >= 0 ||
+               g_cview_src.load(std::memory_order_relaxed) >= 0 ||
+               g_feedview.load(std::memory_order_relaxed) >= 0)
+               reshade::log::message(reshade::log::level::info,
+                  "DaysGone HOTKEY trace refused viewer-armed (turn viewers OFF first)");
+            else
+            {
+               int ttn = g_fulltrace_n.load(std::memory_order_relaxed);
+               if (ttn < 30) ttn = 30;
+               if (ttn > 300) ttn = 300;
+               g_fulltrace_frames_left.store(ttn, std::memory_order_relaxed);
+               g_fulltrace.store(true, std::memory_order_relaxed);
+               char hb[64] = {};
+               snprintf(hb, sizeof(hb), "DaysGone HOTKEY trace start %d", ttn);
+               reshade::log::message(reshade::log::level::info, hb);
+            }
          }
          prev_dlss = down_dlss;
          prev_trace = down_trace;
@@ -5471,107 +5321,109 @@ public:
              g_cui_src.store(us);
        }
 
-       if (ImGui::CollapsingHeader("Motion tuning (advanced)"))
-       {
-          const char* sc_names[] = { "1.0 pass-through (default)", "0.5*res (legacy)", "0.5", "2.0 (half-gain compensation test)" };
-          int sm = g_mv_scale_mode.load();
-          if (ImGui::Combo("MV scale mode", &sm, sc_names, 4))
-             g_mv_scale_mode.store(sm);
-          const char* js_names[] = { "x1 (default)", "x2 (NDC)", "x0.5" };
-          int jm = g_jit_scale_mode.load();
-          if (ImGui::Combo("Jitter scale", &jm, js_names, 3))
-             g_jit_scale_mode.store(jm);
-          bool invd = g_inverted_depth.load();
-          if (ImGui::Checkbox("Inverted depth", &invd))
-             g_inverted_depth.store(invd);
-          bool cso = g_c_srgb_output.load();
-          if (ImGui::Checkbox("sRGB scene output (keep OFF)", &cso))
-             g_c_srgb_output.store(cso);
-           bool mvj = g_mvs_jittered.load();
-           if (ImGui::Checkbox("Game MVs include jitter", &mvj))
-              g_mvs_jittered.store(mvj);
-           // M61: the compute path reads CB0[0]/[1] into cjit but only
-           // feeds it to NGX when this is on (audit proved jit=0).
-           bool cjon = g_cjitter_on.load();
-           if (ImGui::Checkbox("M11 jitter from slot CB0 (audit must show jit!=0)", &cjon))
-              g_cjitter_on.store(cjon);
-          float npl = g_near_plane.load();
-          if (ImGui::SliderFloat("Near plane", &npl, 0.01f, 200.0f, "%.2f"))
-             g_near_plane.store(npl);
-          float fpl = g_far_plane.load();
-          if (ImGui::SliderFloat("Far plane", &fpl, 5000.0f, 2000000.0f, "%.0f"))
-             g_far_plane.store(fpl);
-          float vfov = g_vert_fov.load();
-          if (ImGui::SliderFloat("Vert FOV rad (60deg=1.047, proven 39.4deg=0.688)", &vfov, 0.4f, 1.2f, "%.3f"))
-             g_vert_fov.store(vfov);
-          {
-             const char* ds_names[] = { "Auto: cache-DSV if fresh", "Slot t1 only", "Cache-DSV only" };
-             int dsm = g_cdepth_src.load();
-             if (dsm < 0) dsm = 0; if (dsm > 2) dsm = 2;
-             if (ImGui::Combo("M11 depth source (t1=accum? use cache)", &dsm, ds_names, 3))
-                g_cdepth_src.store(dsm);
-             ImGui::TextWrapped("Compare Viewer: TAA t1 vs Depth cache. Whichever shows the depth silhouette is depth; scene content = accumulation.");
-          }
-       }
-
-       if (ImGui::CollapsingHeader("Pixel M7 (shares Motion + MV + ownMV above)"))
-       {
-          ImGui::TextWrapped("M56: MV decode / scale / depth / ownMV are shared with M11. HDR+PLAIN defaults ON per 50% verdict.");
-          bool hdr = g_dlss_hdr.load();
-          if (ImGui::Checkbox("DLSS hdr flag (fmt24)", &hdr))
-             g_dlss_hdr.store(hdr);
-          bool swu = g_swap_unpack.load();
-          if (ImGui::Checkbox("Swap R/B on unpack", &swu))
-             g_swap_unpack.store(swu);
-          bool bypass = g_dlss_bypass.load();
-          if (ImGui::Checkbox("BYPASS NGX (show input only)", &bypass))
-             g_dlss_bypass.store(bypass);
-          bool plain = g_plain_output.load();
-          if (ImGui::Checkbox("PLAIN output (no sRGB encode)", &plain))
-             g_plain_output.store(plain);
-          bool phdr = g_prefer_hdr.load();
-          if (ImGui::Checkbox("HDR color feed", &phdr))
-             g_prefer_hdr.store(phdr);
-          bool rqu = g_require_upscale.load();
-          if (ImGui::Checkbox("Upscale-only guard", &rqu))
-             g_require_upscale.store(rqu);
-          bool cui = g_composite_ui.load();
-          if (ImGui::Checkbox("Composite t0 UI over DLSS", &cui))
-             g_composite_ui.store(cui);
-          bool aexp = g_dlss_autoexp.load();
-          if (ImGui::Checkbox("Auto exposure (default ON)", &aexp))
-             g_dlss_autoexp.store(aexp);
-          bool swo = g_swap_output.load();
-          if (ImGui::Checkbox("Swap R/B on output", &swo))
-             g_swap_output.store(swo);
-          bool msr = g_mark_sr.load();
-          if (ImGui::Checkbox("Mark SR drawn for core", &msr))
-             g_mark_sr.store(msr);
-          bool jon = g_jitter_on.load();
-          if (ImGui::Checkbox("Game jitter from slot cb0", &jon))
-             g_jitter_on.store(jon);
-          ImGui::Text("cb0[0] raw: %.5f %.5f  px: %.3f %.3f",
-             g_jit_rawx.load(), g_jit_rawy.load(), g_jit_pxx.load(), g_jit_pxy.load());
-          bool jfx = g_jit_flip_x.load();
-          if (ImGui::Checkbox("Jitter flip X", &jfx))
-             g_jit_flip_x.store(jfx);
-          bool jfy = g_jit_flip_y.load();
-          if (ImGui::Checkbox("Jitter flip Y", &jfy))
-             g_jit_flip_y.store(jfy);
-          if (ImGui::Button("Log slot dims to ReShade.log"))
-             g_log_slot.store(true, std::memory_order_relaxed);
-          if (ImGui::Button("Dump slot CB0 floats"))
-             g_dump_cb.store(true, std::memory_order_relaxed);
-          int vsel = g_view_src.load();
-          {
-             const char* vsrc_names[] = { "OFF", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "DEPTH", "MVS", "CONV", "DLSS_OUT", "HDR", "MVFEED" };
-             int vi = vsel + 1;
-             if (vi < 0) vi = 0; if (vi > 14) vi = 14;
-           if (ImGui::Combo("Pixel viewer source", &vi, vsrc_names, 15))
-              g_view_src.store(vi - 1);
+        if (ImGui::CollapsingHeader("Motion tuning (advanced)"))
+        {
+           // Menuclean: only proven-live knobs here (near/far/FOV/depth-src/inv
+           // + M11 jitter). Legacy/scale/sign/sRGB controls moved to the
+           // "Legacy (proven wrong, kept for A/B)" header below.
+           bool invd = g_inverted_depth.load();
+           if (ImGui::Checkbox("Inverted depth", &invd))
+              g_inverted_depth.store(invd);
+            // M61: the compute path reads CB0[0]/[1] into cjit but only
+            // feeds it to NGX when this is on (audit proved jit=0).
+            bool cjon = g_cjitter_on.load();
+            if (ImGui::Checkbox("M11 jitter from slot CB0 (audit must show jit!=0)", &cjon))
+               g_cjitter_on.store(cjon);
+           float npl = g_near_plane.load();
+           if (ImGui::SliderFloat("Near plane", &npl, 0.01f, 200.0f, "%.2f"))
+              g_near_plane.store(npl);
+           float fpl = g_far_plane.load();
+           if (ImGui::SliderFloat("Far plane", &fpl, 5000.0f, 2000000.0f, "%.0f"))
+              g_far_plane.store(fpl);
+           float vfov = g_vert_fov.load();
+           if (ImGui::SliderFloat("Vert FOV rad (60deg=1.047, proven 39.4deg=0.688)", &vfov, 0.4f, 1.2f, "%.3f"))
+              g_vert_fov.store(vfov);
+           {
+              const char* ds_names[] = { "Auto: cache-DSV if fresh", "Slot t1 only", "Cache-DSV only" };
+              int dsm = g_cdepth_src.load();
+              if (dsm < 0) dsm = 0; if (dsm > 2) dsm = 2;
+              if (ImGui::Combo("M11 depth source (t1=accum? use cache)", &dsm, ds_names, 3))
+                 g_cdepth_src.store(dsm);
+              ImGui::TextWrapped("Compare Viewer: TAA t1 vs Depth cache. Whichever shows the depth silhouette is depth; scene content = accumulation.");
            }
-           if (ImGui::Button("Log M7 feed identity"))
-              g_m7feed.store(true, std::memory_order_relaxed);
+           bool aexp = g_dlss_autoexp.load();
+           if (ImGui::Checkbox("Auto exposure (default ON)", &aexp))
+              g_dlss_autoexp.store(aexp);
+        }
+
+        if (ImGui::CollapsingHeader("Legacy (proven wrong, kept for A/B)"))
+        {
+           // Menuclean: M7 pixel path parks while the M11 compute slot fires
+           // (M53 silence-gated unpark). While PARKED the controls below do
+           // nothing -- see the parked note. All globals stay defined for
+           // compat; only the ImGui controls moved here.
+           {
+              uint64_t cur = g_hist_frame.load(std::memory_order_relaxed);
+              uint64_t lf = g_cdlss_last_fire.load(std::memory_order_relaxed);
+              uint64_t sage = (cur >= lf) ? (cur - lf) : 0;
+              bool parked = g_cdlss_master.load(std::memory_order_relaxed) && sage < 30;
+              if (parked)
+                 ImGui::TextWrapped("M7 PARKED (compute slot fired %lluf ago): controls below do nothing until compute goes silent 30+ presents.", (unsigned long long)sage);
+              else
+                 ImGui::TextWrapped("M7 UNPARKED: pixel path live (compute silent %lluf).", (unsigned long long)sage);
+           }
+           const char* sc_names[] = { "1.0 pass-through (default)", "0.5*res (legacy)", "0.5", "2.0 (half-gain compensation test)" };
+           int sm = g_mv_scale_mode.load();
+           if (ImGui::Combo("MV scale mode", &sm, sc_names, 4))
+              g_mv_scale_mode.store(sm);
+           const char* js_names[] = { "x1 (default)", "x2 (NDC)", "x0.5" };
+           int jm = g_jit_scale_mode.load();
+           if (ImGui::Combo("Jitter scale", &jm, js_names, 3))
+              g_jit_scale_mode.store(jm);
+           bool cso = g_c_srgb_output.load();
+           if (ImGui::Checkbox("sRGB scene output (keep OFF, #25 proven wrong)", &cso))
+              g_c_srgb_output.store(cso);
+            bool mvj = g_mvs_jittered.load();
+            if (ImGui::Checkbox("Game MVs include jitter", &mvj))
+               g_mvs_jittered.store(mvj);
+           bool hdr = g_dlss_hdr.load();
+           if (ImGui::Checkbox("DLSS hdr flag (fmt24)", &hdr))
+              g_dlss_hdr.store(hdr);
+           bool swu = g_swap_unpack.load();
+           if (ImGui::Checkbox("Swap R/B on unpack", &swu))
+              g_swap_unpack.store(swu);
+           bool bypass = g_dlss_bypass.load();
+           if (ImGui::Checkbox("BYPASS NGX (show input only)", &bypass))
+              g_dlss_bypass.store(bypass);
+           bool plain = g_plain_output.load();
+           if (ImGui::Checkbox("PLAIN output (no sRGB encode)", &plain))
+              g_plain_output.store(plain);
+           bool phdr = g_prefer_hdr.load();
+           if (ImGui::Checkbox("HDR color feed", &phdr))
+              g_prefer_hdr.store(phdr);
+           bool rqu = g_require_upscale.load();
+           if (ImGui::Checkbox("Upscale-only guard", &rqu))
+              g_require_upscale.store(rqu);
+           bool cui = g_composite_ui.load();
+           if (ImGui::Checkbox("Composite t0 UI over DLSS (M7, use compute one)", &cui))
+              g_composite_ui.store(cui);
+           bool swo = g_swap_output.load();
+           if (ImGui::Checkbox("Swap R/B on output", &swo))
+              g_swap_output.store(swo);
+           bool msr = g_mark_sr.load();
+           if (ImGui::Checkbox("Mark SR drawn for core", &msr))
+              g_mark_sr.store(msr);
+           bool jon = g_jitter_on.load();
+           if (ImGui::Checkbox("Game jitter from slot cb0 (M7, use M11 one)", &jon))
+              g_jitter_on.store(jon);
+           ImGui::Text("cb0[0] raw: %.5f %.5f  px: %.3f %.3f",
+              g_jit_rawx.load(), g_jit_rawy.load(), g_jit_pxx.load(), g_jit_pxy.load());
+           bool jfx = g_jit_flip_x.load();
+           if (ImGui::Checkbox("Jitter flip X", &jfx))
+              g_jit_flip_x.store(jfx);
+           bool jfy = g_jit_flip_y.load();
+           if (ImGui::Checkbox("Jitter flip Y", &jfy))
+              g_jit_flip_y.store(jfy);
         }
 
        if (ImGui::CollapsingHeader("Viewer"))
@@ -5643,90 +5495,121 @@ public:
            }
        }
 
-       if (ImGui::CollapsingHeader("Tools (one-shot diagnostics)"))
-       {
-          if (ImGui::Button("Audit DLSS inputs (10 feeds, BOTH paths)"))
-          {
-             g_audit_seq.store(0, std::memory_order_relaxed);
-             g_audit_left.store(10, std::memory_order_relaxed);
-             char ab[256];
-             snprintf(ab, sizeof(ab),
-                "DaysGone AUDIT start: move + pan for the next 10 DLSS feeds (*=handle changed, !=fidx skip; *=stale risk)");
-             reshade::log::message(reshade::log::level::info, ab);
-          }
-          if (ImGui::Button("Stats: compute inputs (signal check)"))
-             g_cstats.store(true, std::memory_order_relaxed);
-          if (ImGui::Button("Stats: M7 pixel inputs (50% path)"))
-             g_m7stats.store(true, std::memory_order_relaxed);
-          if (ImGui::Button("Log compute TAA u/t dims"))
-             g_clog_slot.store(true, std::memory_order_relaxed);
-          if (ImGui::Button("Dump compute TAA CB0 floats"))
-             g_cdump_cb.store(true, std::memory_order_relaxed);
-          if (ImGui::Button("Scan TAA CBs for projection matrices"))
-             g_cscan_cb.store(true, std::memory_order_relaxed);
-           if (ImGui::Button("Scan velocity-pass CBs (VS+PS)"))
-              g_pscan_cb.store(true, std::memory_order_relaxed);
-           // Full-trace master switch (all configs). Bounded: 1 line/present
-           // to full.log + ReShade.log mirror; never per-draw (5700 draws
-           // per frame would explode the file). N=600 presents ~= 10s.
+        if (ImGui::CollapsingHeader("Tools (one-shot diagnostics)"))
+        {
+           if (ImGui::Button("Audit DLSS inputs (10 feeds, BOTH paths)"))
            {
-              bool ft = g_fulltrace.load(std::memory_order_relaxed);
-              int left = g_fulltrace_frames_left.load(std::memory_order_relaxed);
-              if (ImGui::Checkbox("LOG EVERYTHING (full-trace, next N frames)", &ft))
+              g_audit_seq.store(0, std::memory_order_relaxed);
+              g_audit_left.store(10, std::memory_order_relaxed);
+              char ab[256];
+              snprintf(ab, sizeof(ab),
+                 "DaysGone AUDIT start: move + pan for the next 10 DLSS feeds (*=handle changed, !=fidx skip; *=stale risk)");
+              reshade::log::message(reshade::log::level::info, ab);
+           }
+           if (ImGui::Button("Stats: compute inputs (signal check)"))
+              g_cstats.store(true, std::memory_order_relaxed);
+           if (ImGui::Button("Log compute TAA u/t dims"))
+              g_clog_slot.store(true, std::memory_order_relaxed);
+           if (ImGui::Button("Dump compute TAA CB0 floats"))
+              g_cdump_cb.store(true, std::memory_order_relaxed);
+           if (ImGui::CollapsingHeader("Advanced scans (may hitch)"))
+           {
+              ImGui::TextWrapped("WARNING: these stall the GPU for a scan during gameplay. Press once in gameplay, then check ReShade.log.");
+              if (ImGui::Button("Scan TAA CBs for projection matrices"))
+                 g_cscan_cb.store(true, std::memory_order_relaxed);
+              if (ImGui::Button("Scan velocity-pass CBs (VS+PS)"))
+                 g_pscan_cb.store(true, std::memory_order_relaxed);
+              if (ImGui::Button("Sniff VS CBs for shared matrices (brief hitch)"))
               {
-                 if (ft && left <= 0)
-                    g_fulltrace_frames_left.store(g_fulltrace_n.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                 if (!ft)
-                    g_fulltrace_frames_left.store(0, std::memory_order_relaxed);
-                 g_fulltrace.store(ft, std::memory_order_relaxed);
+                 g_mscan_n = 0;
+                 g_mscan_sniffs = 0;
+                 MScanResetLoc();
+                 g_mscan_frame0 = g_hist_frame.load(std::memory_order_relaxed);
+                 g_mscan_cb.store(true, std::memory_order_relaxed);
               }
-              int nn = g_fulltrace_n.load(std::memory_order_relaxed);
-              if (ImGui::InputInt("full-trace N presents (~10s=600)", &nn))
-              {
-                 if (nn < 1) nn = 1;
-                 if (nn > 100000) nn = 100000;
-                 g_fulltrace_n.store(nn, std::memory_order_relaxed);
-              }
-              if (ImGui::Button("Start full-trace now"))
-              {
-                 g_fulltrace_frames_left.store(g_fulltrace_n.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                 g_fulltrace.store(true, std::memory_order_relaxed);
+           }
+            // Full-trace master switch (all configs). Bounded: 1 line/present
+            // to full.log + ReShade.log mirror; never per-draw (5700 draws
+            // per frame would explode the file). Tracefix: N clamped 30..300
+            // (~5s max), no re-arm while running, viewers-OFF gate like the
+            // bundle buttons (FULL itself is atomics-only, but the bundle
+            // pairs it with pics/passes that SKIP while viewers are armed).
+            {
+               bool ft = g_fulltrace.load(std::memory_order_relaxed);
+               int left = g_fulltrace_frames_left.load(std::memory_order_relaxed);
+               bool running = (left > 0);
+               bool troff = (g_view_src.load(std::memory_order_relaxed) < 0 &&
+                  g_cview_src.load(std::memory_order_relaxed) < 0 &&
+                  g_feedview.load(std::memory_order_relaxed) < 0);
+               if (ImGui::Checkbox("LOG EVERYTHING (full-trace, next N frames)", &ft))
+               {
+                  if (ft && !running)
+                  {
+                     if (!troff)
+                        ft = false; // refuse: checkbox falls back unchecked next frame
+                     else
+                     {
+                        int cn = g_fulltrace_n.load(std::memory_order_relaxed);
+                        if (cn < 30) cn = 30;
+                        if (cn > 300) cn = 300;
+                        g_fulltrace_frames_left.store(cn, std::memory_order_relaxed);
+                     }
+                  }
+                  if (!ft)
+                     g_fulltrace_frames_left.store(0, std::memory_order_relaxed);
+                  g_fulltrace.store(ft, std::memory_order_relaxed);
+               }
+               int nn = g_fulltrace_n.load(std::memory_order_relaxed);
+               if (ImGui::InputInt("full-trace N presents (30-300, ~5s=300)", &nn))
+               {
+                  if (nn < 30) nn = 30;
+                  if (nn > 300) nn = 300;
+                  g_fulltrace_n.store(nn, std::memory_order_relaxed);
+               }
+               if (running)
+                  ImGui::Text("FULL-TRACE ACTIVE: %d presents left (full.log + DaysGone FULL mirror)", left);
+               else if (!troff)
+                  ImGui::TextWrapped("Full-trace unavailable: turn Viewers OFF first.");
+               else if (ImGui::Button("Start full-trace now"))
+               {
+                  int cn2 = g_fulltrace_n.load(std::memory_order_relaxed);
+                  if (cn2 < 30) cn2 = 30;
+                  if (cn2 > 300) cn2 = 300;
+                  g_fulltrace_frames_left.store(cn2, std::memory_order_relaxed);
+                  g_fulltrace.store(true, std::memory_order_relaxed);
 #if !(TEST || DEVELOPMENT)
-                 reshade::log::message(reshade::log::level::info,
-                    "DaysGone FULL note: file logging disabled in Publishing config; ReShade.log mirror only.");
+                  reshade::log::message(reshade::log::level::info,
+                     "DaysGone FULL note: file logging disabled in Publishing config; ReShade.log mirror only.");
 #endif
-              }
-              if (ft)
-                 ImGui::Text("FULL-TRACE ACTIVE: %d presents left (full.log + DaysGone FULL mirror)", left);
-              ImGui::Text("Hotkey: F10 starts full-trace with the N above.");
-           }
-           if (ImGui::Button("Sniff VS CBs for shared matrices (brief hitch)"))
-           {
-              g_mscan_n = 0;
-              g_mscan_sniffs = 0;
-              MScanResetLoc();
-              g_mscan_frame0 = g_hist_frame.load(std::memory_order_relaxed);
-              g_mscan_cb.store(true, std::memory_order_relaxed);
-           }
+               }
+               ImGui::Text("Hotkey: F10 starts full-trace with the N above.");
+            }
 #if TEST || DEVELOPMENT
-           int cap_left = g_cap_frames_left.load();
-           if (cap_left > 0)
-              ImGui::Text("CAPTURING... %d presents left", cap_left);
-           else if (ImGui::Button("Capture 3 frames (TAA hunt)"))
-              g_cap_frames_left.store(3);
-           ImGui::TextWrapped("Read Luma-DaysGone-frame.log: TAA = fullscreen RT + 2x HDR color + depth + velocity.");
+             int cap_left = g_cap_frames_left.load();
+            if (cap_left > 0)
+               ImGui::Text("CAPTURING... %d presents left", cap_left);
+            else if (g_view_src.load(std::memory_order_relaxed) >= 0 || g_cview_src.load(std::memory_order_relaxed) >= 0 || g_feedview.load(std::memory_order_relaxed) >= 0)
+               ImGui::TextWrapped("Capture unavailable: turn Viewers OFF first.");
+            else if (ImGui::Button("Capture 3 frames (TAA hunt)"))
+               g_cap_frames_left.store(3);
+            ImGui::TextWrapped("Read Luma-DaysGone-frame.log: TAA = fullscreen RT + 2x HDR color + depth + velocity.");
 #endif
-           int pic_left = g_pic_frames_left.load();
-           if (pic_left > 0)
-              ImGui::Text("SAVING PICTURES... %d presents left", pic_left);
-           else if (ImGui::Button("Save 3 pictures now"))
-              g_pic_frames_left.store(3);
+            bool viewers_off = (g_view_src.load(std::memory_order_relaxed) < 0 && g_cview_src.load(std::memory_order_relaxed) < 0 && g_feedview.load(std::memory_order_relaxed) < 0);
+            int pic_left = g_pic_frames_left.load();
+            if (pic_left > 0)
+               ImGui::Text("SAVING PICTURES... %d presents left", pic_left);
+            else if (!viewers_off)
+               ImGui::TextWrapped("Pictures unavailable: turn Viewers OFF first.");
+            else if (ImGui::Button("Save 3 pictures now"))
+               g_pic_frames_left.store(3);
            ImGui::TextWrapped("Writes Luma-DaysGone-pic-<present>.bmp + DaysGone PIC mirror in ReShade.log (turn Viewers OFF first).");
-           bool pass_on = g_pass_active.load(std::memory_order_relaxed);
-           int pass_pos = g_pass_pos.load(std::memory_order_relaxed);
-           if (pass_on)
-              ImGui::Text("SAVING PASSES... %d/%d", pass_pos, kPassCount);
-           else if (ImGui::Button("Save all passes now"))
+            bool pass_on = g_pass_active.load(std::memory_order_relaxed);
+            int pass_pos = g_pass_pos.load(std::memory_order_relaxed);
+            if (pass_on)
+               ImGui::Text("SAVING PASSES... %d/%d", pass_pos, kPassCount);
+            else if (!viewers_off)
+               ImGui::TextWrapped("Passes unavailable: turn Viewers OFF first.");
+            else if (ImGui::Button("Save all passes now"))
            {
               g_pass_pos.store(0, std::memory_order_relaxed);
               g_pass_active.store(true, std::memory_order_relaxed);
@@ -5750,7 +5633,9 @@ public:
                  bm, kPassCount,
                  bc, g_bundle_cap.load(std::memory_order_relaxed), bt);
            }
-           else if (ImGui::Button("Save full bundle now"))
+            else if (!viewers_off)
+               ImGui::TextWrapped("Bundle unavailable: turn Viewers OFF first.");
+            else if (ImGui::Button("Save full bundle now"))
            {
               g_pic_frames_left.store(3);
               g_pass_pos.store(0, std::memory_order_relaxed);
@@ -5759,9 +5644,18 @@ public:
               g_cap_frames_left.store(3);
 #endif
               int tn = g_fulltrace_n.load(std::memory_order_relaxed);
-              if (tn < 1) tn = 1;
-              g_fulltrace_frames_left.store(tn, std::memory_order_relaxed);
-              g_fulltrace.store(true, std::memory_order_relaxed);
+               if (tn < 30) tn = 30;
+               if (tn > 300) tn = 300;
+               // Tracefix: bundle button already requires viewers-OFF to press;
+               // still never re-arm a running trace (keeps its countdown).
+               if (g_fulltrace_frames_left.load(std::memory_order_relaxed) <= 0)
+               {
+                  g_fulltrace_frames_left.store(tn, std::memory_order_relaxed);
+                  g_fulltrace.store(true, std::memory_order_relaxed);
+               }
+               else
+                  reshade::log::message(reshade::log::level::info,
+                     "DaysGone BUNDLE note: full-trace already running, keeping its countdown");
               g_bundle_pics.store(3, std::memory_order_relaxed);
               g_bundle_passes.store(kPassCount, std::memory_order_relaxed);
 #if TEST || DEVELOPMENT
@@ -5820,7 +5714,10 @@ static void AppendFullLogLine(HMODULE hModule, const char* text)
       HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
       if (f != INVALID_HANDLE_VALUE)
       {
-         char fline[1024] = {};
+         // Tracefix: FULL line is up to 1408B (line[1408] at the call site) +
+         // CRLF; the old 1024B buffer made sprintf_s hit its invalid-parameter
+         // handler (fail-fast crash, worse with every BUILD_ID suffix bump).
+         char fline[2048] = {};
          sprintf_s(fline, "%s\r\n", text);
          DWORD written = 0;
          WriteFile(f, fline, (DWORD)strlen(fline), &written, nullptr);

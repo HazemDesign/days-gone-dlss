@@ -4,8 +4,9 @@
 // translation row at +640 with negated twin at +896).
 // Rotation path needs no depth/translation (exact look-around).
 // Full path reprojects via depth (R24, reversed-infinite: z = Near/d)
-// with T in two candidate forms (A: V-row3, B: camera pos) -- live A/B
-// settles it. Sky/invalid depth falls back to rotation for that pixel.
+// with T in two candidate forms (A: V-row3, B: camera pos + CPU-double
+// DeltaC -- live A/B settles it). Sky/invalid depth falls back to rotation
+// for that pixel.
 // Output matches the MVConvert convention (zero-centered PIXELS, NGX
 // mvs scale 1.0 pass-through, top-left-positive). OWN_NEG mirrors sign
 // (rotation sign triage; shared NDC math covers full modes too).
@@ -21,6 +22,10 @@ cbuffer OwnMV : register(b0)
     float Near;               // 10.0 (UE cm, TRUE near -- not the NGX slider)
     float2 ProjPrev;          // (p00, p11) PREVIOUS frame -- reproject ONLY (zoom fix)
     float Pad2;
+    float3 DeltaC;            // Ccur-Cprev computed in DOUBLE on CPU (Full-B only:
+                              // absolute world |C| is hundreds+ so forming it in
+                              // float loses the small inter-frame delta)
+    float Pad3;
 };
 Texture2D<float> DepthTex : register(t0); // R24 depth (full modes only)
 
@@ -46,8 +51,11 @@ float2 main(float4 pos : SV_Position) : SV_Target0
         dWorld = RVT_Mul(vpos, RCurr) + Cc;
         dPrev = RV_Mul(dWorld, RPrev) + TPrev.xyz;
 #else
-        dWorld = RVT_Mul(vpos, RCurr) + TCur.xyz;
-        dPrev = RV_Mul(dWorld - TPrev.xyz, RPrev);
+        // Full-B (campos T): prevView = Rprev * (Rcur^T * vpos + DeltaC).
+        // DeltaC is the CPU-double inter-frame delta -- the shader never
+        // forms absolute world (Rcur^T*vpos + Ccur), which loses float
+        // precision when |Ccur| is hundreds+ (breaks at certain angles).
+        dPrev = RV_Mul(RVT_Mul(vpos, RCurr) + DeltaC.xyz, RPrev);
 #endif
     }
     else

@@ -10,7 +10,7 @@
 .EXAMPLE
     pwsh -ExecutionPolicy Bypass -File scripts\build-local.ps1
     pwsh -ExecutionPolicy Bypass -File scripts\build-local.ps1 -Config Development-Release
-    pwsh -ExecutionPolicy Bypass -File scripts\build-local.ps1 -GameDir "G:\Games\Days Gone\BendGame\Binaries\Win64"
+    pwsh -ExecutionPolicy Bypass -File scripts\build-local.ps1 -GameDir "<SteamLibrary>\BendGame\Binaries\Win64"
     (or set $env:LUMA_DAYS_GONE_BIN_PATH to the folder containing DaysGone.exe
     instead of passing -GameDir every time)
 #>
