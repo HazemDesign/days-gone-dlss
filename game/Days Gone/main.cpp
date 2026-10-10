@@ -34,7 +34,7 @@
 #define DG_HOTKEY_DLSS VK_F9
 #define DG_HOTKEY_TRACE VK_F10
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -163,6 +163,12 @@ struct DaysGoneDeviceData : public GameDeviceData
    ComPtr<ID3D11ShaderResourceView> srv_mvs_conv;
    ComPtr<ID3D11RenderTargetView> rtv_mvs_conv;
    uint32_t mvs_conv_w = 0, mvs_conv_h = 0;
+   // Hybrid MVs (M11/compute only): game truth + own fill target. Create/
+   // resize discipline mirrors tex_mvs_conv (R16G16F, render size).
+   ComPtr<ID3D11Texture2D> tex_mvs_hybrid;
+   ComPtr<ID3D11ShaderResourceView> srv_mvs_hybrid;
+   ComPtr<ID3D11RenderTargetView> rtv_mvs_hybrid;
+   uint32_t mvs_hybrid_w = 0, mvs_hybrid_h = 0;
    // M9e: no-scissor rasterizer for copy passes (game leaves blending,
    // 1920-viewport and scissor set -- inherited state blended our copies
    // with stale content = pink hues + unwritten stripes).
@@ -650,6 +656,9 @@ static std::mutex g_mvmap_mutex;
 struct MvBuf { ComPtr<ID3D11Resource> res; uint64_t frame = 0; };
 static std::unordered_map<uint32_t, MvBuf> g_mv_by_hash;
 static std::atomic<int> g_mv_src_mode{ 0 };
+// Hybrid MVs (M11/compute only): game truth where nonzero, own fill where
+// cleared. Default OFF (pure game/own/zero feeds as today).
+static std::atomic<bool> g_hybrid_mv{ false };
 // M28: canonical producer table (file scope: DLSS feed + menu + stats).
 static const uint32_t kMvHashes[6] = { 0xBE0130E5, 0x1E94CABC, 0x5846E9DA, 0x6C6AD505, 0xA1A256FA, 0xA5CB30BF };
 static const char* kMvNames[6] = { "BE0130E5", "1E94CABC", "5846E9DA", "6C6AD505", "A1A256FA", "A5CB30BF" };
@@ -1661,6 +1670,24 @@ public:
           ShaderDefinition{"Luma_DaysGone_MVConvert", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "7"}}});
        native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone MV Convert XNegZero PS"),
           ShaderDefinition{"Luma_DaysGone_MVConvert", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "8"}}});
+       // Hybrid MVs (M11/compute only): game truth + own fill. Same DECODE
+       // variants as MVConvert, mirrored key names.
+       native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone MV Hybrid PS"),
+          ShaderDefinition{"Luma_DaysGone_MVHybrid", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "1"}}});
+       native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone MV Hybrid 025 PS"),
+          ShaderDefinition{"Luma_DaysGone_MVHybrid", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "2"}}});
+       native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone MV Hybrid Zero PS"),
+          ShaderDefinition{"Luma_DaysGone_MVHybrid", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "3"}}});
+       native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone MV Hybrid Neg PS"),
+          ShaderDefinition{"Luma_DaysGone_MVHybrid", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "4"}}});
+       native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone MV Hybrid Zero025 PS"),
+          ShaderDefinition{"Luma_DaysGone_MVHybrid", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "5"}}});
+       native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone MV Hybrid NegZero PS"),
+          ShaderDefinition{"Luma_DaysGone_MVHybrid", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "6"}}});
+       native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone MV Hybrid YNegZero PS"),
+          ShaderDefinition{"Luma_DaysGone_MVHybrid", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "7"}}});
+       native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone MV Hybrid XNegZero PS"),
+          ShaderDefinition{"Luma_DaysGone_MVHybrid", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"DECODE", "8"}}});
        // M47: own rotation-exact camera MVs (stash-fed view matrices).
        native_shaders_definitions.emplace(CompileTimeStringHash("DaysGone OwnMV PS"),
           ShaderDefinition{"Luma_DaysGone_OwnMV", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"OWN_NEG", "0"}, {"FULLMODE", "0"}}});
@@ -3298,6 +3325,85 @@ public:
                                 c_mv_res = mv_sel;
                                 c_mv_real = (mv_sel != nullptr);
                                 c_mv_src = mv_sel_name;
+                             }
+                          }
+                       }
+                       // Hybrid MVs (M11/compute only, default OFF): per-pixel
+                       // game truth + own fill. Own output (tex_mvs_conv) and
+                       // the resolved game buffer (mv_sel) are both live here,
+                       // so decode+select fuse into ONE pass into tex_mvs_hybrid
+                       // (no second target, no feed restructuring). Toggle OFF
+                       // or missing input: falls through untouched (game conv
+                       // OR own OR zero fallback, codes unchanged).
+                       if (g_hybrid_mv.load(std::memory_order_relaxed) && own_done_c && mv_sel && gd.srv_mvs_conv)
+                       {
+                          if (!gd.tex_mvs_hybrid || gd.mvs_hybrid_w != crw || gd.mvs_hybrid_h != crh)
+                          {
+                             gd.srv_mvs_hybrid.reset();
+                             gd.rtv_mvs_hybrid.reset();
+                             gd.tex_mvs_hybrid.reset();
+                             D3D11_TEXTURE2D_DESC hd = {};
+                             hd.Width = crw; hd.Height = crh;
+                             hd.MipLevels = 1; hd.ArraySize = 1;
+                             hd.Format = DXGI_FORMAT_R16G16_FLOAT;
+                             hd.SampleDesc.Count = 1;
+                             hd.Usage = D3D11_USAGE_DEFAULT;
+                             hd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+                             ComPtr<ID3D11Texture2D> ht;
+                             if (SUCCEEDED(native_device->CreateTexture2D(&hd, nullptr, ht.put())))
+                             {
+                                ComPtr<ID3D11ShaderResourceView> hs;
+                                ComPtr<ID3D11RenderTargetView> hr;
+                                if (SUCCEEDED(native_device->CreateShaderResourceView(ht.get(), nullptr, hs.put())) &&
+                                    SUCCEEDED(native_device->CreateRenderTargetView(ht.get(), nullptr, hr.put())))
+                                {
+                                   gd.tex_mvs_hybrid = ht;
+                                   gd.srv_mvs_hybrid = hs;
+                                   gd.rtv_mvs_hybrid = hr;
+                                   gd.mvs_hybrid_w = crw; gd.mvs_hybrid_h = crh;
+                                }
+                             }
+                          }
+                          if (gd.rtv_mvs_hybrid)
+                          {
+                             int hdec = g_mv_decode.load(std::memory_order_relaxed);
+                             uint32_t hybkey = (hdec == 2) ? CompileTimeStringHash("DaysGone MV Hybrid 025 PS")
+                                : (hdec == 3) ? CompileTimeStringHash("DaysGone MV Hybrid Zero PS")
+                                : (hdec == 4) ? CompileTimeStringHash("DaysGone MV Hybrid Neg PS")
+                                : (hdec == 5) ? CompileTimeStringHash("DaysGone MV Hybrid Zero025 PS")
+                                : (hdec == 6) ? CompileTimeStringHash("DaysGone MV Hybrid NegZero PS")
+                                : (hdec == 7) ? CompileTimeStringHash("DaysGone MV Hybrid YNegZero PS")
+                                : (hdec == 8) ? CompileTimeStringHash("DaysGone MV Hybrid XNegZero PS")
+                                : CompileTimeStringHash("DaysGone MV Hybrid PS");
+                             ID3D11PixelShader* hyb_ps = device_data.native_pixel_shaders[hybkey].get();
+                             ID3D11VertexShader* hcopy_vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
+                             ComPtr<ID3D11ShaderResourceView> game_raw_srv;
+                             if (hyb_ps && hcopy_vs && SUCCEEDED(native_device->CreateShaderResourceView(mv_sel, nullptr, game_raw_srv.put())))
+                             {
+                                DrawStateStack<DrawStateStackType::FullGraphics> hyb_cs;
+                                hyb_cs.Cache(native_device_context, device_data.uav_max_count);
+                                ID3D11UnorderedAccessView* hnull_uavs[D3D11_1_UAV_SLOT_COUNT] = {};
+                                native_device_context->CSSetUnorderedAccessViews(0, device_data.uav_max_count, hnull_uavs, nullptr);
+                                D3D11_VIEWPORT hvp = {};
+                                hvp.TopLeftX = 0.0f; hvp.TopLeftY = 0.0f;
+                                hvp.Width = (float)crw; hvp.Height = (float)crh;
+                                hvp.MinDepth = 0.0f; hvp.MaxDepth = 1.0f;
+                                native_device_context->RSSetViewports(1, &hvp);
+                                native_device_context->RSSetState(gd.rs_copy.get());
+                                native_device_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+                                native_device_context->OMSetDepthStencilState(nullptr, 0);
+                                native_device_context->OMSetRenderTargets(1, &gd.rtv_mvs_hybrid, nullptr);
+                                native_device_context->VSSetShader(hcopy_vs, nullptr, 0);
+                                native_device_context->PSSetShader(hyb_ps, nullptr, 0);
+                                ID3D11ShaderResourceView* hyb_srvs[2] = { game_raw_srv.get(), gd.srv_mvs_conv.get() };
+                                native_device_context->PSSetShaderResources(0, 2, hyb_srvs);
+                                native_device_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                                native_device_context->Draw(4, 0);
+                                hyb_cs.Restore(native_device_context);
+                                c_mv_res = gd.tex_mvs_hybrid.get();
+                                c_mv_real = true;
+                                c_mv_src = "hybrid";
+                                c_mv_code = 5;
                              }
                           }
                        }
@@ -5183,8 +5289,8 @@ public:
           uint64_t att = g_cdlss_attempts.load(), pres = g_hist_frame.load();
           ImGui::Text("Slot fire rate: %.2f/present (1.0 = gameplay)",
              pres ? (double)att / (double)pres : 0.0);
-           static const char* code_names[] = { "zero", "auto-cache", "slot-t0", "named", "own" };
-           int cc = g_clast_code.load(); if (cc < 0 || cc > 4) cc = 0;
+           static const char* code_names[] = { "zero", "auto-cache", "slot-t0", "named", "own", "hybrid" };
+           int cc = g_clast_code.load(); if (cc < 0 || cc > 5) cc = 0;
           ImGui::Text("Last: ok=%d reset=%d %dx%d->%dx%d mv=%s(%s) fmt=%d hash=%08X jit=%.2f,%.2f",
              g_clast_ok.load(), g_clast_reset.load(),
              g_clast_rw.load(), g_clast_rh.load(), g_clast_ow.load(), g_clast_oh.load(),
@@ -5288,17 +5394,20 @@ public:
           int msm = g_mv_src_mode.load();
           if (ImGui::Combo("MV source (velocity pass)", &msm, mvsrc_names, 7))
              g_mv_src_mode.store(msm);
-          int msm2 = g_mv_src_mode.load();
-          if (msm2 >= 1 && msm2 <= 6)
-          {
-             bool mfr = false;
-             {
-                std::lock_guard<std::mutex> mlk(g_mvmap_mutex);
-                auto it2 = g_mv_by_hash.find(kMvHashes[msm2 - 1]);
-                mfr = (it2 != g_mv_by_hash.end() && it2->second.frame == g_hist_frame.load(std::memory_order_relaxed));
-             }
-             ImGui::Text("Selected %s: %s", kMvNames[msm2 - 1], mfr ? "FRESH" : "STALE (native fallback)");
-          }
+           int msm2 = g_mv_src_mode.load();
+           if (msm2 >= 1 && msm2 <= 6)
+           {
+              bool mfr = false;
+              {
+                 std::lock_guard<std::mutex> mlk(g_mvmap_mutex);
+                 auto it2 = g_mv_by_hash.find(kMvHashes[msm2 - 1]);
+                 mfr = (it2 != g_mv_by_hash.end() && it2->second.frame == g_hist_frame.load(std::memory_order_relaxed));
+              }
+              ImGui::Text("Selected %s: %s", kMvNames[msm2 - 1], mfr ? "FRESH" : "STALE (native fallback)");
+           }
+           bool hyb = g_hybrid_mv.load();
+           if (ImGui::Checkbox("Hybrid MVs (game truth + own fill)", &hyb))
+              g_hybrid_mv.store(hyb);
        }
        {
           const char* dc_names[] = { "Raw", "Upstream UE (default)", "0.25-cent", "UE+zero-snap", "Negated", "Snap+0.25", "Neg+zero-snap", "Y-neg+snap", "X-neg+snap" };
