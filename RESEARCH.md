@@ -1259,3 +1259,99 @@ Running record of everything found. Newest at the bottom. Sources noted inline.
   (use DepthN channel; scene content = accumulation = switch
   `M11 depth source` to cache); color = scene RGB (cyan = pair
   instead of HDR); output = DLSS result (compare vs OFF).
+
+## 70. DLSS input-contract audit (2026-10-10)
+
+- Audited all 14 NGX DrawData/Settings fields against proof, not parity:
+  FOV slider default 1.047 (60deg) is PROVEN-wrong vs the stashed view
+  (~0.688 = ~39.4deg, set ~0.64-0.69); MV sign is UNPROVEN (matrix
+  unfinished); M11-vs-M7 jitter identity contradicts itself (CB [0]/[1]
+  animate but may not be the reprojection jitter); mvs_jittered,
+  near/far, and transfer function are asserted-parity only; reactive
+  mask is never provided (correct: this title has no UI-mask source);
+  normals/roughness are correctly absent for SR; black dots =
+  sky/depth-boundary pixels + alpha-zero output (not a feed bug).
+- Action: FOV slider defaults stay, but the proven value is ~0.688.
+
+## 71. Hotkeys: F9 DLSS toggle, F10 trace start (2026-10-10)
+
+- No keybind mechanism exists in this overlay, so OnPresent polls
+  `GetAsyncKeyState` edge-triggered per present (`DG_HOTKEY_DLSS`/
+  `DG_HOTKEY_TRACE` defines at top of main.cpp). F9 toggles the M11
+  master (same reset sequence as its checkbox); F10 arms full-trace N
+  (same as `Start full-trace now`). Every fire mirrors
+  `DaysGone HOTKEY dlss=on/off` / `trace start N` to ReShade.log.
+
+## 72. Stale-view lock-in + RT-identity viewfilter (2026-10-10)
+
+- Diagnosis: the pool is built from the FIRST ≤8 qualifying VS-CB1
+  draws per frame, so shadow/cascade/static views (byte-identical
+  across frames) fill it and the moving gameplay view drawn later
+  never enters. npool==1 then commits a stale view every present
+  while owng=0/vfp look alive. `rot=` measures only multi-candidate
+  elections, so a quiet 0.0000 proves nothing about staleness.
+- Fix (capture site): pool only draws whose bound RT is
+  gameplay-sized (≥400x200, same thresholds as the depth/viewer
+  gates). Refused draws count `g_view_pool_skips`, never consume
+  cap, never touch committed. Single-view and shadow-only frames
+  behave exactly as before (fast path / npool==0 no-commit).
+- Verifiability in FULL: `preads=` (pool reads), `pskip=`
+  (refusals), `pickck=%08X` (FNV-1a of the elected R block).
+
+## 73. Depth-cache gameplay gate (2026-10-10)
+
+- `cached_depth` attached from ANY ≥400x200 DSV (last-writer-wins),
+  so at some angles a shadow/cascade/foreign DSV won and Full-B
+  reprojected through stale/wrong depth (FULL `dage=` climbed at
+  dead angles). Same viewfilter principle: the store now requires a
+  gameplay-sized color RT bound ALONGSIDE the DSV; depth-only or
+  small-RT draws leave the last fresh cache untouched.
+- `g_cdepth_src` semantics untouched (Auto/cache/t1). New FULL
+  field `dskip=` counts refusals next to `dage=`.
+
+## 74. Motion-gain audit + MV scale 2.0 test mode (2026-10-10)
+
+- Top suspect: both emitters (MVConvert decode `*-w/h` path,
+  OwnMV `*0.5` at L68-70) share a ×0.5 factor; if NGX expects
+  full-fraction motion, every feed runs at half magnitude
+  (proportional smear from both sources). Scale-1.0 passthrough is
+  asserted, unproven. No mode, default, shader, or feed changed.
+- Test: 4th `MV scale mode` entry `2.0 (half-gain compensation
+  test)` (index 3, shows as `msc=3`/`cfg=3`). A/B vs 1.0 while
+  panning; sharper = half-gain confirmed.
+
+## 75. Game-MV hunt verdict: no full-scene external MV exists (2026-10-10)
+
+- By construction: the TAA slot (CS 242D9D62) takes NO MV input
+  (motion resolves internally), and the six velocity pixel shaders
+  share ONE fullscreen fmt35 target written per-draw — static,
+  alpha, and skinned pixels are never drawn and stay cleared zero.
+  There is no buffer anywhere holding full-scene external game MVs
+  to find. Closed as a hunt; the answer is Hybrid (next).
+
+## 76. Hybrid MVs design (2026-10-10)
+
+- Rule per pixel: game-decoded != (0,0) ? game : own-camera-Full-B.
+  Where the game has truth the feed is identical to today; cleared
+  pixels get own motion instead of zero MVs. M11/compute path
+  only, default OFF (`Hybrid MVs (game truth + own fill)`),
+  `c_mv_src="hybrid"`, `c_mv_code=5` (all log lines stay readable).
+- Shape: one fused decode+select pass into one new R16G16F triple
+  (own output and game decode share the single conv target, so both
+  can never coexist as separate textures). Scales incl. x2.0 apply
+  downstream unchanged. M7 pixel path untouched.
+
+## 77. Engine.ini velocity research (2026-10-10)
+
+- Shipping-safe config attempt (no mod dependency): under
+  `[SystemSettings]` set `r.BasePassOutputsVelocity=1`,
+  `r.BasePassForceOutputsVelocity=1`,
+  `r.VertexDeformationOutputsVelocity=1` (forces static/skinned
+  velocity writes). Caveat: UE 4.11.1-era existence of these CVars
+  is unverified for this Bend fork — confirm each takes (no-op vs
+  unknown-CVar warning) before trusting any change.
+- Controls: `r.DepthOfFieldQuality=0` isolates DoF-vs-motion blur
+  (DoF off + streaks persist = motion path, not DoF). Known side
+  effect: forced velocity can water-streak (translucent water
+  writes velocity it shouldn't); A/B with/without on the same
+  shoreline pan.

@@ -7,7 +7,7 @@ TAA, so the generic Luma-Unreal mod never engages here — this project targets
 the actual resolve slots (pixel TAAU `000573B8` for showcase/upscale modes,
 compute TAA `242D9D62` for gameplay).
 
-Current build id: `m55-...-crashfix-pics-allpasses-fullbundle`
+Current build id: `m55-...-mvscale2x-hybrid`
 (see `DG_BUILD_ID` in `game/Days Gone/main.cpp`). Plan and milestones:
 `Todolist.txt`. Research notes: `RESEARCH.md`.
 
@@ -32,11 +32,17 @@ Open the ReShade/Luma menu (Home). The Days Gone section has:
 - **DLSS Masters** — `M7 DLSS at TAAU 000573B8 (showcase/upscale)` and
   `M11 DLSS at COMPUTE TAA 242D9D62 (gameplay DLAA)`. Both on = M11 while the
   compute slot fires, M7 takes over when it goes silent. Needs Super
-  Resolution set to DLSS in the Luma menu.
+  Resolution set to DLSS in the Luma menu. Hotkeys: F9 = M11 toggle,
+  F10 = start full-trace.
 - **Motion / MV / jitter tuning** — MV source and decode mode, own-camera MVs,
-  MV/jitter scale modes, inverted depth, near/far planes, UI composite
-  (source, blend, tonemap), sRGB/plain output switches. Defaults are the
-  tested-good combo; change one thing at a time.
+  `Hybrid MVs (game truth + own fill)` (default OFF, M11/compute only),
+  MV/jitter scale modes (incl. `2.0 (half-gain compensation test)`),
+  inverted depth, near/far planes, FOV slider (set ~0.64–0.69 — the 1.047
+  default is proven wrong, true view is ~0.688), UI composite
+  (source, blend, tonemap), sRGB/plain output switches. View/depth caches
+  only accept gameplay-sized targets now (shadow-only draws can't poison
+  the pool or depth — watch `preads/pskip/pickck`, `dskip=` in FULL).
+  Defaults are the tested-good combo; change one thing at a time.
 - **Viewer** — `Compute viewer source` (TAA t0–t3/u0–u1, velocity/depth/HDR
   caches, DLSS output, MV feed), `DLSS feed (exact NGX input)` (M11/M7
   color/depth/MV/output — what DLSS actually got), `Viewer channel`

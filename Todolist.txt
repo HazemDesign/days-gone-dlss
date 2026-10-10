@@ -18,3 +18,10 @@ M7: Wire Luma NGX DLSS DLAA (render==output, no resize). UseLumaNGX=true. Auto-e
 M8: First DLSS frame bound to TAA output. Log sr_type/instance/inputs/runs.
 M9: Fix MV/depth/jitter (ghosting, flicker), then Quality/Balanced (67%/58%), then Transformer E/F.
 Final: Scene -> DLSS (at TAA) -> post -> UI -> Present. UI never through DLSS.
+
+Status 2026-10-10 (build m55-...-mvscale2x-hybrid): M1-M9 closed — DLSS runs at
+both slots with audited feeds, RT-identity view/depth filters, full-trace +
+bundle diagnostics. Also done: hotkeys (F9 M11 toggle, F10 trace start),
+MV scale 2.0 half-gain test mode, Hybrid MVs (default OFF, M11-only, code 5).
+Pending USER test (paste FULL lines + screenshots): hybrid ON, MV scale 1.0
+vs 2.0 A/B while panning, FOV 0.638.
