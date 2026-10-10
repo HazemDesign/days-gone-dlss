@@ -34,7 +34,7 @@
 #define DG_HOTKEY_DLSS VK_F9
 #define DG_HOTKEY_TRACE VK_F10
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid-menuclean-mvraw-tracefix-cleanup";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid-menuclean-mvraw-tracefix-cleanup-resfix-deep1-m7stub-trace1200";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -135,6 +135,9 @@ struct DaysGoneDeviceData : public GameDeviceData
    // the HDR post family does (full-res R24G8 DSV). Latest seen wins.
    ComPtr<ID3D11Resource> cached_depth;
    uint64_t cached_depth_frame = 0;
+   // Resfix: depth-dims at cache time (warn when cache-DSV size != live
+   // render size at the M11 slot; NGX + OwnMV assume depth == render).
+   uint32_t cached_depth_w = 0, cached_depth_h = 0;
    // M8: per-frame velocity cache. Producers: 1E94CABC/5846E9DA/6C6AD505/
    // A1A256FA/A5CB30BF/BE0130E5 render the persistent 1920x1080 RG buffer
    // (fmt35 = R16G16_UNORM per UE convention); depth/motion CS consume it.
@@ -152,12 +155,8 @@ struct DaysGoneDeviceData : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_dlss_out;
    ComPtr<ID3D11ShaderResourceView> srv_dlss_out;
    uint32_t dlss_out_w = 0, dlss_out_h = 0;
-   // M9b: own FP16 color input. NGX misreads packed fmt24 (red channel
-   // lost -- cyan image); hardware converts UNORM10 -> float on load.
-   ComPtr<ID3D11Texture2D> tex_color_in;
-   ComPtr<ID3D11ShaderResourceView> srv_color_in;
-   ComPtr<ID3D11RenderTargetView> rtv_color_in;
-   uint32_t color_in_w = 0, color_in_h = 0;
+    // Deepclean-m7stub: M9b unpack target deleted (M7-only resource; M11
+    // feeds fmt10 HDR direct, no unpack).
    // M24: decoded MV target (fmt35 (v+1)*0.25 -> 0.5-centered via x2 pass).
    ComPtr<ID3D11Texture2D> tex_mvs_conv;
    ComPtr<ID3D11ShaderResourceView> srv_mvs_conv;
@@ -184,9 +183,11 @@ struct DaysGoneDeviceData : public GameDeviceData
     // M11 compute-TAA (CS 242D9D62) DLSS state.
     bool first_cdlss_frame = true;
     uint32_t cdlss_runs = 0;
-    bool logged_cdraw_result = false;
-    bool logged_ccapture_fail = false;
-    bool logged_crtv_fail = false;
+     bool logged_cdraw_result = false;
+     bool logged_ccapture_fail = false;
+     bool logged_crtv_fail = false;
+     // Resfix: one-shot depth-dims mismatch warn (re-armed on every resize).
+     bool logged_cdepth_dims = false;
     // M47: own-MV view stash (VS CB1 2048B: VP at +0, R at +128).
     // M51: 768B (adds +640 translation row for full 6DOF).
     float view_cb_cur[192] = {};
@@ -435,18 +436,14 @@ static std::atomic<uint64_t> g_depth_cache_skips{ 0 };
 static std::atomic<int> g_clast_preads{ 0 };
 static std::atomic<unsigned long long> g_clast_pskip{ 0 };
 static std::atomic<uint32_t> g_view_pick_cksum{ 0 };
-// templog: FULL/FULLAGG snapshot + accumulator atoms (log-only, no behavior).
+// templog: FULL snapshot atoms (log-only, no behavior). Deep1: FULLAGG
+// window accumulators retired (single FULL 300-frame + AUDIT + cSTATS cover
+// diagnosis); g_agg_* decls + feed-path stores + writer block deleted.
 static std::atomic<int> g_view_pick_snap{ -1 };
 static std::atomic<int> g_view_npool_snap{ 0 };
 static std::atomic<float> g_view_rotmag{ 0.0f };
 static std::atomic<uint64_t> g_clast_dage{ 0 };
-static std::atomic<uint64_t> g_agg_jitn{ 0 };
-static std::atomic<int64_t> g_agg_jitsumx{ 0 }, g_agg_jitsumy{ 0 }; // milli-pixels
-static std::atomic<uint64_t> g_agg_q00{ 0 }, g_agg_q01{ 0 }, g_agg_q10{ 0 }, g_agg_q11{ 0 };
-static std::atomic<uint64_t> g_agg_rotn{ 0 };
-static std::atomic<int64_t> g_agg_rotsum{ 0 }, g_agg_rotmax{ 0 }; // milli units
-static std::atomic<uint64_t> g_agg_resets{ 0 };
-static std::atomic<uint64_t> g_agg_projrej{ 0 };
+// (Deep1: g_agg_* FULLAGG accumulators deleted; see note above.)
 // viewfilter: FNV-1a over the 64B R block (cb+32) identifying a pooled view.
 static uint32_t ViewPickCksum(const float* cb)
 {
@@ -517,7 +514,6 @@ static void ElectViewPick(DaysGoneDeviceData& god, uint64_t frame)
          if (jd < 0.8f && (d0 > tol0 || d1 > tol1))
          {
             g_view_projrej.fetch_add(1, std::memory_order_relaxed);
-            g_agg_projrej.fetch_add(1, std::memory_order_relaxed);
             // Escape hatch: a challenger projection STABLE across 5 straight
             // frames (real zoom/cut) re-anchors to it.
             float hd0 = w.p00 - god.view_hold_p00; if (hd0 < 0) hd0 = -hd0;
@@ -565,7 +561,7 @@ static void ElectViewPick(DaysGoneDeviceData& god, uint64_t frame)
       jdpass++;
       float d0 = god.view_pool[i].p00 - c0; if (d0 < 0) d0 = -d0;
       float d1 = god.view_pool[i].p11 - c1; if (d1 < 0) d1 = -d1;
-      if (d0 > tol0 || d1 > tol1) { g_view_projrej.fetch_add(1, std::memory_order_relaxed); g_agg_projrej.fetch_add(1, std::memory_order_relaxed); continue; }
+      if (d0 > tol0 || d1 > tol1) { g_view_projrej.fetch_add(1, std::memory_order_relaxed); continue; }
       float dp = d0 + d1;
       if (best < 0 || god.view_pool[i].hits > god.view_pool[best].hits ||
           (god.view_pool[i].hits == god.view_pool[best].hits && dp < bestdp))
@@ -597,13 +593,6 @@ static void ElectViewPick(DaysGoneDeviceData& god, uint64_t frame)
        if (dd > mjd) mjd = dd;
     }
     g_view_rotmag.store(mjd, std::memory_order_relaxed); // templog: winner rotation delta
-    g_agg_rotn.fetch_add(1, std::memory_order_relaxed);
-    g_agg_rotsum.fetch_add((int64_t)(mjd * 1000.0f), std::memory_order_relaxed);
-    {
-       int64_t mv = (int64_t)(mjd * 1000.0f);
-       int64_t cur = g_agg_rotmax.load(std::memory_order_relaxed);
-       while (mv > cur && !g_agg_rotmax.compare_exchange_weak(cur, mv)) {}
-    }
    if (mjd < 0.05f)
    {
       CommitViewPick(god, w.cb, w.p00, w.p11, frame, best); // continuous
@@ -686,7 +675,8 @@ static std::atomic<uint64_t> g_cview_blits{ 0 };
 // gating as frame/draws logs). ReShade.log mirror runs in every config.
 static std::atomic<bool> g_fulltrace{ false };
 static std::atomic<int> g_fulltrace_frames_left{ 0 };
-// Tracefix: default 300 (~5s), hard clamp 30..300 at every arm site.
+// Tracefix: default 300 (~5s), hard clamp 30..1200 at every arm site.
+// Trace1200: 1200 (~20s) allowed with batched file IO + overflow-proof buffers.
 // N=100000 meant ~28min of per-present file open/append/close + 1.4KB
 // ReShade mirror on the present thread (IO hitch + 100MB+ logs).
 static std::atomic<int> g_fulltrace_n{ 300 };
@@ -850,9 +840,10 @@ static bool CreateDepthViewSRV(ID3D11Device* dev, ID3D11Resource* res, ComPtr<ID
    }
    return CreateViewSRV(dev, res, out);
 }
-// M42: auto-diagnostic mode. Arms all one-shot diagnostics (cSTATS, CB dump,
-// MSCAN, pSCAN) and auto-fires them on the next compute slot fire. No user
+// M42: auto-diagnostic mode. Arms one-shot diagnostics (cSTATS, CB dump,
+// slot logger) and auto-fires them on the next compute slot fire. No user
 // interaction needed beyond pressing the button and playing the game.
+// Deep1: scan arms retired with the scan bodies.
 static std::atomic<bool> g_auto_diag{ false };
 // M43: multi-frame ADIAG countdown (4 consecutive compute-slot fires).
 static std::atomic<int> g_adiag_left{ 0 };
@@ -1422,71 +1413,13 @@ static bool RunUIComposite(ID3D11Device* dev, ID3D11DeviceContext* ctx, DeviceDa
    return true;
 }
 
-// M39: differential matrix hunt (own-camera-MV groundwork). pSCAN shape
-// matching only found animated per-object constants. But a VIEW matrix is
-// constant across ALL producers within one frame -- so instead of judging
-// single 4x4s by shape, capture VS CB0/CB1 (the 256B single-matrix CBs) at
-// several producers and diff them: bit-identical across producers in the
-// same frame = per-frame constant = view/viewproj candidate. FNV hash over
-// exact bytes (same upload = identical bits; no epsilon needed).
-static uint32_t Fnv1aBytes(const void* p, size_t n)
-{
-   const uint8_t* b = (const uint8_t*)p;
-   uint32_t h = 2166136261u;
-   for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
-   return h;
-}
-struct PScanCap { uint32_t ps = 0; uint64_t frame = 0; float vs0[16] = {}; float vs1[16] = {}; bool has_vs0 = false; bool has_vs1 = false; };
-static std::mutex g_pscan_mutex;
-static PScanCap g_pscan_caps[8];
-static int g_pscan_ncaps = 0;
-static bool ReadCB16(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Buffer* cb, float out16[16])
-{
-   if (!dev || !ctx || !cb || !out16)
-      return false;
-   D3D11_BUFFER_DESC bd = {};
-   cb->GetDesc(&bd);
-   if (bd.ByteWidth < 64)
-      return false;
-   D3D11_BUFFER_DESC sd = {};
-   sd.ByteWidth = bd.ByteWidth;
-   sd.Usage = D3D11_USAGE_STAGING;
-   sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-   ComPtr<ID3D11Buffer> st;
-   if (FAILED(dev->CreateBuffer(&sd, nullptr, st.put())))
-      return false;
-   ctx->CopySubresourceRegion(st.get(), 0, 0, 0, 0, cb, 0, nullptr);
-   D3D11_MAPPED_SUBRESOURCE m = {};
-   if (FAILED(ctx->Map(st.get(), 0, D3D11_MAP_READ, 0, &m)) || !m.pData)
-      return false;
-   memcpy(out16, m.pData, 64);
-   ctx->Unmap(st.get(), 0);
-   return true;
-}
-// M41: broad VS-CB matrix census (Path 1, upstream parity). pSCAN2 hunts
-// at known velocity producers; this sniffs small VS CBs at EVERY pixel
-// draw while armed (one-shot, ~1-2 frames of hitch) and ranks 4x4s by
-// cross-shader sharing: a constant shared across shaders in one frame is
-// a view/viewproj candidate. Shape tags: PROJ = upstream
-// MatrixLikeProjection exactly; VIEW = last row (0,0,0,1) + sane rotation
-// rows (upstream only tests projections -- views fail its m33~0 rule, so
-// views need their own test or they stay invisible).
-static std::atomic<bool> g_mscan_cb{ false };
-struct MScanEntry { uint32_t hash = 0; int count = 0; uint32_t eg_ps = 0; int eg_slot = 0; int eg_off = 0; int shape = 0; float m[16] = {}; float m1[16] = {}; uint64_t f0 = 0, f1 = 0; uint32_t ps_b = 0, ps_c = 0; int nps = 0; }; // M43: m1 = last-seen values (pan-delta = camera score)
-static MScanEntry g_mscan[256]; // M46: raised (panning fragments hashes)
-static int g_mscan_n = 0;
-static int g_mscan_sniffs = 0;
-static uint64_t g_mscan_frame0 = 0; // M46: span start (sniff must cover panning)
-static uint64_t g_mscan_lastframe = 0; // M46: throttle window
-static int g_mscan_perframe = 0; // M46: sniffs used in g_mscan_lastframe
-// M43: per-LOCATION tracker (slot 0-3 x 64B-offset 0-3). Content-hash entries
-// fragment when the camera pans (new hash per value), so animation is tracked
-// here instead: first vs last values + distinct-value count per VS-CB slot.
-// PAN while sniffing: distinct>>1 + dmax>>0 = camera-animated VIEW matrix;
-// distinct==1 + dmax~0 = static PROJ matrix. This is the own-MV feed pick.
-struct MLocTrack { bool seen = false; float first[16] = {}; float last[16] = {}; int distinct = 0; uint32_t lasth = 0; uint32_t wlast = 0; };
-static MLocTrack g_mloc[4][32]; // M49: full-CB offsets (translation hunt)
-static void MScanResetLoc() { for (int s = 0; s < 4; s++) for (int o = 0; o < 32; o++) g_mloc[s][o] = MLocTrack(); }
+// Deep1: pSCAN helpers retired with the draw body above (FNV hash,
+// PScanCap table, CB16 reader). M44 shape tags below stay: the live
+// view-pool capture still shape-tests candidate projections.
+// Deep1: M41 census state retired with the draw body (entry table,
+// throttle window, per-location tracker + reset). M44 shape tags below stay:
+// the live view-pool capture still shape-tests candidate projections.
+static std::atomic<bool> g_mscan_cb{ false }; // retired trigger (menu note only)
 static bool M44LikeProj(const float* m)
 {
    auto nz = [](float v) { return v > -1e-3f && v < 1e-3f; };
@@ -1518,59 +1451,8 @@ static int M44ShapeTag(const float* m)
    if (M44LikeView(t)) return 2;
    return 0;
 }
-// M34: scan one constant buffer for projection-shaped 4x4s (ROW + COL
-// layouts). Shared by the compute-TAA scan and the velocity-pass scan.
-static void ScanOneCBForProj(ID3D11Device* dev, ID3D11DeviceContext* ctx,
-   const char* stage, int slot, ID3D11Buffer* cb)
-{
-   if (!dev || !ctx || !cb)
-      return;
-   D3D11_BUFFER_DESC cbd = {};
-   cb->GetDesc(&cbd);
-   char hb[128];
-   snprintf(hb, sizeof(hb), "DaysGone cSCAN %sCB%d size=%u", stage, slot, cbd.ByteWidth);
-   reshade::log::message(reshade::log::level::info, hb);
-   if (cbd.ByteWidth < 64)
-      return;
-   D3D11_BUFFER_DESC sd = {};
-   sd.ByteWidth = cbd.ByteWidth;
-   sd.Usage = D3D11_USAGE_STAGING;
-   sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-   ComPtr<ID3D11Buffer> st;
-   if (FAILED(dev->CreateBuffer(&sd, nullptr, st.put())))
-      return;
-   ctx->CopySubresourceRegion(st.get(), 0, 0, 0, 0, cb, 0, nullptr);
-   D3D11_MAPPED_SUBRESOURCE cm = {};
-   if (FAILED(ctx->Map(st.get(), 0, D3D11_MAP_READ, 0, &cm)) || !cm.pData)
-      return;
-   const float* cf = (const float*)cm.pData;
-   int nf = cbd.ByteWidth / 4;
-   auto cnz = [](float v, float e) { return v > -e && v < e; };
-   for (int o = 0; o + 16 <= nf; o += 16)
-   {
-      for (int tr = 0; tr < 2; tr++)
-      {
-         float m[16];
-         for (int r = 0; r < 4; r++)
-            for (int c = 0; c < 4; c++)
-               m[r * 4 + c] = (tr == 0) ? cf[o + r * 4 + c] : cf[o + c * 4 + r];
-         float m20 = m[8], m21 = m[9], m22 = m[10], m23 = m[11];
-         float m30 = m[12], m31 = m[13], m32 = m[14], m33 = m[15];
-         bool rows = cnz(m[1], 1e-3f) && cnz(m[2], 1e-3f) && cnz(m[3], 1e-3f)
-            && cnz(m[4], 1e-3f) && cnz(m[6], 1e-3f) && cnz(m[7], 1e-3f);
-         bool persp = (m23 > 0.95f || m23 < -0.95f);
-         bool lastrow = cnz(m30, 1e-3f) && cnz(m31, 1e-3f) && (!cnz(m22, 1e-6f) || !cnz(m32, 1e-6f));
-         if (rows && persp && lastrow)
-         {
-            char b[512];
-            snprintf(b, sizeof(b), "DaysGone cSCAN %sCB%d+%d %s PROJ? m20=%.5f m21=%.5f m22=%.5f m23=%.3f m32=%.5f m33=%.5f",
-               stage, slot, o * 4, (tr == 0) ? "ROW" : "COL", m20, m21, m22, m23, m32, m33);
-            reshade::log::message(reshade::log::level::info, b);
-         }
-      }
-   }
-   ctx->Unmap(st.get(), 0);
-}
+// Deep1: ScanOneCBForProj retired with both callers (compute-TAA CB scan,
+// velocity-pass scan). M44 shape tags above stay for the live view-pool.
 
 class DaysGoneGame final : public Game
 {
@@ -1789,313 +1671,12 @@ public:
       }
 #endif
 
-       // M39: differential velocity-pass CB scan (masterless). The shape
-       // matcher (below, kept) only finds animated per-object constants --
-       // view matrices are constant across producers WITHIN one frame, so
-       // capture VS CB0/CB1 at up to 8 distinct producers, then diff: a
-       // 4x4 bit-identical across producers in the same frame is a
-       // per-frame constant = view/viewproj candidate for the own-MV
-       // generator. Disarms after 4 distinct producers (same-frame compare
-       // is the goal; cross-frame pairs are flagged, camera may move).
-       if (!is_custom_pass && stages != reshade::api::shader_stage::all_compute &&
-           g_pscan_cb.load(std::memory_order_relaxed))
-       {
-          uint32_t wps = original_shader_hashes.pixel_shaders.empty() ? 0 : original_shader_hashes.pixel_shaders[0];
-          bool is_mv = (wps == 0x1E94CABC || wps == 0x5846E9DA || wps == 0x6C6AD505 ||
-             wps == 0xA1A256FA || wps == 0xA5CB30BF || wps == 0xBE0130E5);
-          if (is_mv && native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
-          {
-             bool finalize = false;
-             {
-                std::lock_guard<std::mutex> plk(g_pscan_mutex);
-                bool seen = false;
-                for (int i = 0; i < g_pscan_ncaps; i++)
-                   if (g_pscan_caps[i].ps == wps) { seen = true; break; }
-                if (!seen && g_pscan_ncaps < 8)
-                {
-                   PScanCap& c = g_pscan_caps[g_pscan_ncaps++];
-                   c.ps = wps;
-                   c.frame = g_hist_frame.load(std::memory_order_relaxed);
-                   ID3D11Buffer* v0 = nullptr;
-                   native_device_context->VSGetConstantBuffers(0, 1, &v0);
-                   if (v0) { c.has_vs0 = ReadCB16(native_device, native_device_context, v0, c.vs0); v0->Release(); }
-                   ID3D11Buffer* v1 = nullptr;
-                   native_device_context->VSGetConstantBuffers(1, 1, &v1);
-                   if (v1) { c.has_vs1 = ReadCB16(native_device, native_device_context, v1, c.vs1); v1->Release(); }
-                   char pb[128];
-                   snprintf(pb, sizeof(pb), "DaysGone pSCAN2 cap %d/4 producer %08X frame=%llu vs0=%d vs1=%d",
-                      g_pscan_ncaps, wps, (unsigned long long)c.frame, (int)c.has_vs0, (int)c.has_vs1);
-                   reshade::log::message(reshade::log::level::info, pb);
-                }
-                if (g_pscan_ncaps >= 4)
-                {
-                   finalize = true;
-                   g_pscan_cb.store(false, std::memory_order_relaxed);
-                }
-             }
-             if (finalize)
-             {
-                // Pairwise diff under the same lock scope: same-frame
-                // identical 4x4s are the candidates; log full values.
-                std::lock_guard<std::mutex> plk(g_pscan_mutex);
-                for (int s = 0; s < 2; s++)
-                {
-                   const char* sname = (s == 0) ? "VS0" : "VS1";
-                   char hb[512];
-                   int pos = snprintf(hb, sizeof(hb), "DaysGone pSCAN2 %s hashes:", sname);
-                   uint32_t hh[8] = {};
-                   for (int i = 0; i < g_pscan_ncaps && pos < (int)sizeof(hb) - 32; i++)
-                   {
-                      bool has = (s == 0) ? g_pscan_caps[i].has_vs0 : g_pscan_caps[i].has_vs1;
-                      const float* m = (s == 0) ? g_pscan_caps[i].vs0 : g_pscan_caps[i].vs1;
-                      hh[i] = has ? Fnv1aBytes(m, 64) : 0;
-                      pos += snprintf(hb + pos, sizeof(hb) - pos, " %08X=%08X%s",
-                         g_pscan_caps[i].ps, hh[i], (g_pscan_caps[i].frame == g_pscan_caps[0].frame) ? "" : "(DIFF-FRAME)");
-                   }
-                   reshade::log::message(reshade::log::level::info, hb);
-                   for (int i = 0; i < g_pscan_ncaps; i++)
-                   {
-                      if (!((s == 0) ? g_pscan_caps[i].has_vs0 : g_pscan_caps[i].has_vs1) || hh[i] == 0)
-                         continue;
-                      // Find all same-frame partners sharing this hash.
-                      char grp[256];
-                      int gp = snprintf(grp, sizeof(grp), "DaysGone pSCAN2 SHARED %s", sname);
-                      int members = 0;
-                      for (int j = i; j < g_pscan_ncaps && gp < (int)sizeof(grp) - 16; j++)
-                      {
-                         bool hasj = (s == 0) ? g_pscan_caps[j].has_vs0 : g_pscan_caps[j].has_vs1;
-                         if (!hasj || hh[j] != hh[i] || g_pscan_caps[j].frame != g_pscan_caps[i].frame)
-                            continue;
-                         // Skip if already reported as part of an earlier group.
-                         bool dup = false;
-                         for (int k = i; k < j; k++)
-                         {
-                            bool hask = (s == 0) ? g_pscan_caps[k].has_vs0 : g_pscan_caps[k].has_vs1;
-                            if (hask && hh[k] == hh[i] && g_pscan_caps[k].frame == g_pscan_caps[i].frame) { dup = true; break; }
-                         }
-                         if (dup)
-                            continue;
-                         gp += snprintf(grp + gp, sizeof(grp) - gp, " %08X", g_pscan_caps[j].ps);
-                         members++;
-                      }
-                      if (members >= 2)
-                      {
-                         reshade::log::message(reshade::log::level::info, grp);
-                         const float* m = (s == 0) ? g_pscan_caps[i].vs0 : g_pscan_caps[i].vs1;
-                         char vb[512];
-                         snprintf(vb, sizeof(vb),
-                            "DaysGone pSCAN2 CANDIDATE %s hash=%08X frame=%llu [%.5f %.5f %.5f %.5f / %.5f %.5f %.5f %.5f / %.5f %.5f %.5f %.5f / %.5f %.5f %.5f %.5f]",
-                            sname, hh[i], (unsigned long long)g_pscan_caps[i].frame,
-                            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
-                            m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
-                         reshade::log::message(reshade::log::level::info, vb);
-                      }
-                   }
-                }
-                g_pscan_ncaps = 0;
-             }
-             // Legacy shape scan at the first producer only (sizes + PROJ?
-             // reference); the differential pSCAN2 result is the real hunt.
-             static bool legacy_done = false;
-             if (!legacy_done)
-             {
-                legacy_done = true;
-                char pb[96];
-                snprintf(pb, sizeof(pb), "DaysGone pSCAN at producer %08X", wps);
-                reshade::log::message(reshade::log::level::info, pb);
-                for (int slot = 0; slot < 8; slot++)
-                {
-                   ID3D11Buffer* vcb = nullptr;
-                   native_device_context->VSGetConstantBuffers(slot, 1, &vcb);
-                   if (vcb)
-                   {
-                      ScanOneCBForProj(native_device, native_device_context, "VS", slot, vcb);
-                      vcb->Release();
-                   }
-                   ID3D11Buffer* pcb = nullptr;
-                   native_device_context->PSGetConstantBuffers(slot, 1, &pcb);
-                   if (pcb)
-                   {
-                      ScanOneCBForProj(native_device, native_device_context, "PS", slot, pcb);
-                      pcb->Release();
-                   }
-                }
-             }
-             else if (!g_pscan_cb.load(std::memory_order_relaxed))
-                legacy_done = false; // re-arm with the next scan request
-           }
-        }
+       // Deep1: M39 differential scan body deleted (own-MV generator proven;
+       // PScanCap/ReadCB16/Fnv1aBox helpers retired with it).
 
-        // M41: one-shot VS-CB census (masterless). While armed, sniff small
-        // VS CBs (256/512/1024/2048B) at pixel draws: read back the
-        // first 256B, test each 64B-aligned 4x4 (shape-tagged), dedup by
-        // exact hash. M44: spans ~240 presents (~4s) so the window covers
-        // camera PANNING -- the user must pan while it runs; a still camera
-        // leaves every matrix static and the view/proj pick is impossible.
-        // Shared across 2+ shaders with 3+ sightings = view-matrix CANDIDATE;
-        // per-location first/last (LOC lines) = animation proof.
-        if (!is_custom_pass && stages != reshade::api::shader_stage::all_compute &&
-            g_mscan_cb.load(std::memory_order_relaxed) &&
-            native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
-        {
-           uint32_t mps = original_shader_hashes.pixel_shaders.empty() ? 0 : original_shader_hashes.pixel_shaders[0];
-           uint64_t mframe = g_hist_frame.load(std::memory_order_relaxed);
-           if (mframe != g_mscan_lastframe) { g_mscan_lastframe = mframe; g_mscan_perframe = 0; }
-           int drew = 0;
-           // M46: throttle to 4 sniffs/frame so the ~240-frame window really
-           // spans the pan (m44 burned all 2048 sniffs in frame 1, then the
-           // span watched nothing: every entry froze at f0==f1).
-           for (int slot = 0; slot < 4 && g_mscan_sniffs < 2048 && drew < 2 && g_mscan_perframe < 4; slot++)
-          {
-             ID3D11Buffer* mcb = nullptr;
-             native_device_context->VSGetConstantBuffers(slot, 1, &mcb);
-             if (!mcb)
-                continue;
-             D3D11_BUFFER_DESC mbd = {};
-             mcb->GetDesc(&mbd);
-              bool is_small_cb = (mbd.ByteWidth == 256 || mbd.ByteWidth == 512 || mbd.ByteWidth == 1024 || mbd.ByteWidth == 2048);
-              if (!is_small_cb)
-             {
-                mcb->Release();
-                continue;
-             }
-             D3D11_BUFFER_DESC msd = {};
-             msd.ByteWidth = mbd.ByteWidth;
-             msd.Usage = D3D11_USAGE_STAGING;
-             msd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-             ComPtr<ID3D11Buffer> mst;
-             bool ok = SUCCEEDED(native_device->CreateBuffer(&msd, nullptr, mst.put()));
-             if (ok)
-             {
-                native_device_context->CopySubresourceRegion(mst.get(), 0, 0, 0, 0, mcb, 0, nullptr);
-                D3D11_MAPPED_SUBRESOURCE mm = {};
-                ok = SUCCEEDED(native_device_context->Map(mst.get(), 0, D3D11_MAP_READ, 0, &mm)) && mm.pData;
-                if (ok)
-                {
-                    drew++;
-                    g_mscan_sniffs++;
-                    g_mscan_perframe++; // M46: throttle budget
-                    const float* mf = (const float*)mm.pData;
-                    int n4 = mbd.ByteWidth / 64; // M49: full CB (translation may live deep)
-                    if (n4 > 32) n4 = 32; if (n4 < 0) n4 = 0;
-                   for (int o = 0; o < n4; o++)
-                   {
-                      const float* m = mf + o * 16;
-                      uint32_t h = Fnv1aBytes(m, 64);
-                      if (h == 0)
-                         continue; // all-zero padding, no signal
-                      int tag = M44ShapeTag(m);
-                      MScanEntry* e = nullptr;
-                      for (int i = 0; i < g_mscan_n; i++)
-                         if (g_mscan[i].hash == h) { e = &g_mscan[i]; break; }
-                       if (!e)
-                       {
-                          if (g_mscan_n >= 256)
-                             continue;
-                         e = &g_mscan[g_mscan_n++];
-                         e->hash = h;
-                         e->eg_ps = mps; e->eg_slot = slot; e->eg_off = o * 64;
-                         e->shape = tag;
-                         memcpy(e->m, m, 64);
-                         e->f0 = mframe;
-                      }
-                       e->count++;
-                       e->f1 = mframe;
-                       memcpy(e->m1, m, 64); // M43: track last values for pan-delta
-                       if (mps != e->eg_ps && mps != e->ps_b && mps != e->ps_c)
-                       {
-                          if (e->ps_b == 0) e->ps_b = mps;
-                          else if (e->ps_c == 0) e->ps_c = mps;
-                          e->nps++;
-                       }
-                       // M43: location track (pan-proof): same slot+offset
-                       // across sniffs, first vs last values.
-                       {
-                          MLocTrack& lt = g_mloc[slot][o];
-                          if (!lt.seen) { lt.seen = true; memcpy(lt.first, m, 64); memcpy(lt.last, m, 64); lt.distinct = 1; lt.lasth = h; }
-                          else
-                          {
-                             memcpy(lt.last, m, 64);
-                             if (h != lt.lasth) { lt.lasth = h; lt.distinct++; }
-                          }
-                          lt.wlast = mbd.ByteWidth;
-                       }
-                   }
-                   native_device_context->Unmap(mst.get(), 0);
-                }
-             }
-             mcb->Release();
-          }
-           if (g_mscan_sniffs >= 48 && (mframe - g_mscan_frame0) >= 240)
-           {
-              g_mscan_cb.store(false, std::memory_order_relaxed);
-             char mh[128];
-             snprintf(mh, sizeof(mh), "DaysGone MSCAN done sniffs=%d distinct=%d", g_mscan_sniffs, g_mscan_n);
-             reshade::log::message(reshade::log::level::info, mh);
-             const char* shapes[] = { "other", "PROJ", "VIEW" };
-             for (int i = 0; i < g_mscan_n; i++)
-             {
-                MScanEntry& e = g_mscan[i];
-                if (e.count < 2)
-                   continue;
-                int sh = e.shape < 0 || e.shape > 2 ? 0 : e.shape;
-                char ml[256];
-                snprintf(ml, sizeof(ml), "DaysGone MSCAN %s hash=%08X n=%d nps=%d frames=%llu-%llu e.g. ps=%08X vs%d+%d",
-                   shapes[sh], e.hash, e.count, e.nps + 1,
-                   (unsigned long long)e.f0, (unsigned long long)e.f1,
-                   e.eg_ps, e.eg_slot, e.eg_off);
-                reshade::log::message(reshade::log::level::info, ml);
-                if (e.nps >= 1 && e.count >= 3)
-                 {
-                    char mv[512];
-                    snprintf(mv, sizeof(mv),
-                       "DaysGone MSCAN CANDIDATE %s hash=%08X [%.5f %.5f %.5f %.5f / %.5f %.5f %.5f %.5f / %.5f %.5f %.5f %.5f / %.5f %.5f %.5f %.5f]",
-                       shapes[sh], e.hash,
-                       e.m[0], e.m[1], e.m[2], e.m[3], e.m[4], e.m[5], e.m[6], e.m[7],
-                       e.m[8], e.m[9], e.m[10], e.m[11], e.m[12], e.m[13], e.m[14], e.m[15]);
-                    reshade::log::message(reshade::log::level::info, mv);
-                    // M43: last-seen values + max element delta first->last.
-                    // PAN while sniffing: dmax>>0 = camera-animated (VIEW pick
-                    // for the own-MV generator), dmax~0 = static (PROJ pick).
-                    float dmax = 0.0f;
-                    for (int k = 0; k < 16; k++)
-                    {
-                       float dd = e.m1[k] - e.m[k]; if (dd < 0) dd = -dd;
-                       if (dd > dmax) dmax = dd;
-                    }
-                    char ml2[512];
-                    snprintf(ml2, sizeof(ml2),
-                       "DaysGone MSCAN CAND-LAST hash=%08X dmax=%.5f [%.5f %.5f %.5f %.5f / %.5f %.5f %.5f %.5f / %.5f %.5f %.5f %.5f / %.5f %.5f %.5f %.5f]",
-                       e.hash, dmax,
-                       e.m1[0], e.m1[1], e.m1[2], e.m1[3], e.m1[4], e.m1[5], e.m1[6], e.m1[7],
-                       e.m1[8], e.m1[9], e.m1[10], e.m1[11], e.m1[12], e.m1[13], e.m1[14], e.m1[15]);
-                    reshade::log::message(reshade::log::level::info, ml2);
-                 }
-              }
-              // M43: per-location animation report (pan-proof view/proj pick).
-              for (int ls = 0; ls < 4; ls++) for (int lo = 0; lo < 32; lo++)
-              {
-                 MLocTrack& lt = g_mloc[ls][lo];
-                 if (!lt.seen)
-                    continue;
-                 float ldmax = 0.0f;
-                 for (int k = 0; k < 16; k++)
-                 {
-                    float dd = lt.last[k] - lt.first[k]; if (dd < 0) dd = -dd;
-                    if (dd > ldmax) ldmax = dd;
-                 }
-                 char ll[1024];
-                 snprintf(ll, sizeof(ll),
-                    "DaysGone MSCAN LOC vs%d+%d w=%u distinct=%d dmax=%.5f first=[%.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f] last=[%.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f]",
-                    ls, lo * 64, (unsigned)lt.wlast, lt.distinct, ldmax,
-                    lt.first[0], lt.first[1], lt.first[2], lt.first[3], lt.first[4], lt.first[5], lt.first[6], lt.first[7],
-                    lt.first[8], lt.first[9], lt.first[10], lt.first[11], lt.first[12], lt.first[13], lt.first[14], lt.first[15],
-                    lt.last[0], lt.last[1], lt.last[2], lt.last[3], lt.last[4], lt.last[5], lt.last[6], lt.last[7],
-                    lt.last[8], lt.last[9], lt.last[10], lt.last[11], lt.last[12], lt.last[13], lt.last[14], lt.last[15]);
-                 reshade::log::message(reshade::log::level::info, ll);
-              }
-           }
-       }
+        // Deep1: M39/M41 scan bodies deleted (matrices proven: rotation-only
+        // stash + Full-B campos-T feed; M44 shape tags stay for the live
+        // view-pool capture below). Triggers removed from menu + AUTO-DIAGNOSE.
 
        // M7b: depth cache -- grab any large DSV while DLSS master is on (the
        // TAAU slot binds no depth itself; the HDR post family does).
@@ -2237,6 +1818,7 @@ public:
                       gd.cached_depth.attach(tmp);
                      tmp = nullptr;
                      gd.cached_depth_frame = g_hist_frame.load(std::memory_order_relaxed);
+                     gd.cached_depth_w = d.Width; gd.cached_depth_h = d.Height;
                       }
                       else
                          g_depth_cache_skips.fetch_add(1, std::memory_order_relaxed);
@@ -2425,13 +2007,7 @@ public:
            g_cstats.store(true, std::memory_order_relaxed);
            g_cdump_cb.store(true, std::memory_order_relaxed);
            g_clog_slot.store(true, std::memory_order_relaxed);
-           g_cscan_cb.store(true, std::memory_order_relaxed);
-           g_pscan_cb.store(true, std::memory_order_relaxed);
-           g_mscan_n = 0;
-           g_mscan_sniffs = 0;
-           MScanResetLoc();
-           g_mscan_frame0 = g_hist_frame.load(std::memory_order_relaxed);
-           g_mscan_cb.store(true, std::memory_order_relaxed);
+           // Deep1: scan arms retired with the scan bodies (matrices proven).
            g_adiag_left.store(4, std::memory_order_relaxed);
            g_adiag_feed.store(4, std::memory_order_relaxed);
            {
@@ -2610,20 +2186,8 @@ public:
                    ccb0->Release();
                 }
              }
-             // M32/M33/M34: one-shot projection-matrix scan (masterless,
-             // own-camera-MV groundwork). Row + column layouts via helper.
-             if (g_cscan_cb.exchange(false, std::memory_order_relaxed) && is_imm_c && device_data.game)
-             {
-                for (int cslot = 0; cslot < 8; cslot++)
-                {
-                   ID3D11Buffer* ccb = nullptr;
-                   native_device_context->CSGetConstantBuffers(cslot, 1, &ccb);
-                   if (!ccb)
-                      continue;
-                   ScanOneCBForProj(native_device, native_device_context, "CS", cslot, ccb);
-                   ccb->Release();
-                }
-             }
+             // Deep1: M32/M33/M34 projection-matrix scan deleted (matrices
+             // proven; own-MV generator ships).
             // M19: one-shot input signal stats (masterless). Proves per-mode
             // whether MV/color/depth buffers carry any signal at all: zero-
             // variance MVs (or constant jitter) make every scale sweep a no-op.
@@ -2946,6 +2510,19 @@ public:
                             c_depth.reset();
                             c_depth = gdd.cached_depth;
                             c_depth_src = "cache-DSV";
+                            // Resfix: depth-size vs live render check (NGX +
+                            // OwnMV assume depth == render). Fed anyway (M58:
+                            // slot-t1 fallback is worse), but warned once per
+                            // resize so a mismatch is diagnosable, not silent.
+                            if ((gdd.cached_depth_w != crw || gdd.cached_depth_h != crh) &&
+                                !gdd.logged_cdepth_dims)
+                            {
+                               gdd.logged_cdepth_dims = true;
+                               char dwarn[192];
+                               snprintf(dwarn, sizeof(dwarn), "DaysGone cDLSS depth-dims %ux%u vs render %ux%u (cache-DSV fed anyway)",
+                                  gdd.cached_depth_w, gdd.cached_depth_h, crw, crh);
+                               reshade::log::message(reshade::log::level::warning, dwarn);
+                            }
                          }
                       }
                    }
@@ -2971,9 +2548,12 @@ public:
                   for (int i = 0; i < 4; i++) { if (raw_uavs[i]) raw_uavs[i]->Release(); }
                   for (int i = 0; i < 8; i++) { if (raw_csrvs[i]) raw_csrvs[i]->Release(); }
 
-                  auto& gd = *static_cast<DaysGoneDeviceData*>(device_data.game);
-                   bool cinputs_ok = c_color && c_depth && c_out0 && crw >= 400 && cow >= 400 && // M55: was 1000
-                      cfmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
+                   auto& gd = *static_cast<DaysGoneDeviceData*>(device_data.game);
+                    bool cinputs_ok = c_color && c_depth && c_out0 && crw >= 400 && cow >= 400 && // M55: was 1000
+                       cfmt == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                       // Resfix: sane upscale clamp (DLSS modes top out at 3x;
+                       // beyond 4x is mode-confusion, not DLSS territory).
+                       cow <= crw * 4 && coh <= crh * 4;
                    if (!cinputs_ok)
                    {
                       g_cfail_capture.fetch_add(1, std::memory_order_relaxed);
@@ -3413,6 +2993,36 @@ public:
                          g_cmv_frames_real.fetch_add(1, std::memory_order_relaxed);
                       else
                          g_cmv_frames_zero.fetch_add(1, std::memory_order_relaxed);
+                      // Resfix: resize-detect BEFORE UpdateSettings so force_reset
+                      // is armed before NGX sees new dims (it used to run
+                      // after: NGX got new dims with old-sized internal
+                      // targets, reset reaching only DrawData). M62 window
+                      // resize + M64 render-scale change. Also drops the view
+                      // election hysteresis + re-arms the depth-dims warn so a
+                      // new aspect re-elects immediately instead of holding
+                      // stale projection for 5 frames.
+                      {
+                         uint32_t pcw = g_c_last_cw.load(std::memory_order_relaxed);
+                         uint32_t pch = g_c_last_ch.load(std::memory_order_relaxed);
+                         uint32_t prw = g_c_last_crw.load(std::memory_order_relaxed);
+                         uint32_t prh = g_c_last_crh.load(std::memory_order_relaxed);
+                         if (pcw && pch && (cow != pcw || coh != pch || crw != prw || crh != prh))
+                         {
+                            device_data.force_reset_sr = true;
+                            gd.view_hold_run = 0;
+                            gd.view_pick_run = 0;
+                            gd.view_reanchor_run = 0;
+                            gd.logged_cdepth_dims = false;
+                            char rb[128];
+                            snprintf(rb, sizeof(rb), "DaysGone cDLSS resize %ux%u -> %ux%u (render %ux%u): forcing NGX reset",
+                               pcw, pch, cow, coh, crw, crh);
+                            reshade::log::message(reshade::log::level::info, rb);
+                         }
+                         g_c_last_cw.store(cow, std::memory_order_relaxed);
+                         g_c_last_ch.store(coh, std::memory_order_relaxed);
+                         g_c_last_crw.store(crw, std::memory_order_relaxed);
+                         g_c_last_crh.store(crh, std::memory_order_relaxed);
+                      }
                       SR::SettingsData csettings_data;
                      csettings_data.output_width = cow;
                      csettings_data.output_height = coh;
@@ -3455,27 +3065,7 @@ public:
                       }
                       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, csettings_data);
 
-                     // M62: window resize (game UAV changed size) => force NGX reset.
-                     // M64: render-size change counts too (render-scale slider).
-                     {
-                        uint32_t pcw = g_c_last_cw.load(std::memory_order_relaxed);
-                        uint32_t pch = g_c_last_ch.load(std::memory_order_relaxed);
-                        uint32_t prw = g_c_last_crw.load(std::memory_order_relaxed);
-                        uint32_t prh = g_c_last_crh.load(std::memory_order_relaxed);
-                        if (pcw && pch && (cow != pcw || coh != pch || crw != prw || crh != prh))
-                        {
-                           device_data.force_reset_sr = true;
-                           char rb[128];
-                           snprintf(rb, sizeof(rb), "DaysGone cDLSS resize %ux%u -> %ux%u (render %ux%u): forcing NGX reset",
-                              pcw, pch, cow, coh, crw, crh);
-                           reshade::log::message(reshade::log::level::info, rb);
-                        }
-                        g_c_last_cw.store(cow, std::memory_order_relaxed);
-                        g_c_last_ch.store(coh, std::memory_order_relaxed);
-                        g_c_last_crw.store(crw, std::memory_order_relaxed);
-                        g_c_last_crh.store(crh, std::memory_order_relaxed);
-                     }
-                     const bool creset = device_data.force_reset_sr || gd.first_cdlss_frame;
+                      const bool creset = device_data.force_reset_sr || gd.first_cdlss_frame;
                      device_data.force_reset_sr = false;
                      if (!gd.tex_dlss_out || !c_mv_res)
                      {
@@ -3536,13 +3126,7 @@ public:
                                        // are a CONSTANT 1px offset, not jitter).
                                        g_jit_rawx.store(f[0]);
                                        g_jit_rawy.store(f[1]);
-                                       // templog: FULLAGG jitter accumulators (log-only).
-                                       // quad<xs><ys>: 1 = non-negative axis.
-                                       g_agg_jitn.fetch_add(1, std::memory_order_relaxed);
-                                       g_agg_jitsumx.fetch_add((int64_t)(f[0] * 1000.0f), std::memory_order_relaxed);
-                                       g_agg_jitsumy.fetch_add((int64_t)(f[1] * 1000.0f), std::memory_order_relaxed);
-                                       if (f[0] >= 0.0f) { if (f[1] >= 0.0f) g_agg_q11.fetch_add(1, std::memory_order_relaxed); else g_agg_q10.fetch_add(1, std::memory_order_relaxed); }
-                                       else { if (f[1] >= 0.0f) g_agg_q01.fetch_add(1, std::memory_order_relaxed); else g_agg_q00.fetch_add(1, std::memory_order_relaxed); }
+                                       // (Deep1: FULLAGG jitter accumulators retired.)
                                        cjit_x = f[0];
                                        cjit_y = f[1];
                                        if (cjit_x > 32.0f || cjit_x < -32.0f || cjit_y > 32.0f || cjit_y < -32.0f)
@@ -3663,23 +3247,26 @@ public:
                            // RTV-bindable -- then we stay native (log once).
                            // M13/M15/M20: HUD composite over u0 ONLY (u1 must
                            // stay scene-clean for next frame's history).
-                           bool ccopied0 = false, ccopied1 = false;
-                           bool c_srgb = g_c_srgb_output.load(std::memory_order_relaxed);
-                           // M22: force-opaque scene alpha (dark-gradient triage).
-                           bool c_alpha1 = (g_c_alpha_mode.load(std::memory_order_relaxed) == 1);
-                           ComPtr<ID3D11RenderTargetView> c_rtv0, c_rtv1;
-                           if (SUCCEEDED(native_device->CreateRenderTargetView(c_out0.get(), nullptr, c_rtv0.put())))
-                           {
-                              ccopied0 = RunCopyPass(native_device, native_device_context, device_data, gd,
-                                 gd.srv_dlss_out.get(), c_rtv0.get(), cow, coh,
-                                 g_swap_output.load(std::memory_order_relaxed), c_srgb, -1, true, c_alpha1);
-                           }
-                           if (c_out1 && SUCCEEDED(native_device->CreateRenderTargetView(c_out1.get(), nullptr, c_rtv1.put())))
-                           {
-                              ccopied1 = RunCopyPass(native_device, native_device_context, device_data, gd,
-                                 gd.srv_dlss_out.get(), c_rtv1.get(), cow, coh,
-                                 g_swap_output.load(std::memory_order_relaxed), false, -1, true, c_alpha1);
-                           }
+                            // Deep1: single linear-opaque scene path (u0+u1). The
+                            // sRGB/swap/alpha triad is retired: user verdicts
+                            // proved sRGB wrong (#25/#33) and plain+opaque the
+                            // match. Flags stay defined for menu/linker compat
+                            // but no longer feed M11. UI composite below keeps
+                            // its proven premult + encode-only combo live.
+                            bool ccopied0 = false, ccopied1 = false;
+                            ComPtr<ID3D11RenderTargetView> c_rtv0, c_rtv1;
+                            if (SUCCEEDED(native_device->CreateRenderTargetView(c_out0.get(), nullptr, c_rtv0.put())))
+                            {
+                               ccopied0 = RunCopyPass(native_device, native_device_context, device_data, gd,
+                                  gd.srv_dlss_out.get(), c_rtv0.get(), cow, coh,
+                                  false, false, -1, true, true);
+                            }
+                            if (c_out1 && SUCCEEDED(native_device->CreateRenderTargetView(c_out1.get(), nullptr, c_rtv1.put())))
+                            {
+                               ccopied1 = RunCopyPass(native_device, native_device_context, device_data, gd,
+                                  gd.srv_dlss_out.get(), c_rtv1.get(), cow, coh,
+                                  false, false, -1, true, true);
+                            }
                            (void)ccopied1;
                             if (!ccopied0)
                             {
@@ -3716,7 +3303,6 @@ public:
                                if (creset)
                                {
                                   g_cdlss_resets.fetch_add(1, std::memory_order_relaxed);
-                                  g_agg_resets.fetch_add(1, std::memory_order_relaxed); // templog FULLAGG window
                                }
                               if (g_mark_sr.load(std::memory_order_relaxed))
                                  device_data.has_drawn_sr = true;
@@ -3790,796 +3376,14 @@ public:
                       "DaysGone M53: compute slot firing -- M7 pixel path parked.");
                 }
              }
-            if (device_data.sr_type != SR::Type::None)
+            // M7 STUB (deepclean-m7stub): pixel path retired; M11 compute 0x242D9D62 is the only live DLSS path. Slot detect, master flag + 30-present auto-unpark reads above stay live (menu parked/unparked state + attempts counter). Unpack/HDR-feed/copies/composite/feed bodies deleted; native TAAU always runs via fallthrough.
             {
-               auto* sr_instance_data = device_data.GetSRInstanceData();
-               // Immediate context only ??" NGX work submission isn't safe on deferred lists.
-               bool is_immediate = (native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE);
-               if (sr_instance_data && is_immediate)
+               static bool logged_stub = false;
+               if (!logged_stub)
                {
-                  // Inputs: t1/t2 ping-pong color pair (1920x1080 fmt24).
-                  // M7b: scan t0-t15 (depth hides above t3) + R32F depth.
-                  ComPtr<ID3D11ShaderResourceView> srvs[16] = {};
-                  ID3D11ShaderResourceView* raw_srvs[16] = {};
-                  native_device_context->PSGetShaderResources(0, 16, raw_srvs);
-                  for (int i = 0; i < 16; i++) srvs[i] = raw_srvs[i];
-                  ComPtr<ID3D11Resource> res_color;
-                  uint32_t rw = 0, rh = 0;
-                  // M7c: among fmt24 render-size candidates, pick the one
-                  // WRITTEN this frame (current); the ping-pong twin is stale
-                  // history. Feeding them alternately = 30Hz flash (M7 bug).
-                  // srv_color_pick survives for the M9b unpack pass below.
-                  ComPtr<ID3D11ShaderResourceView> srv_color_pick;
-                  {
-                     struct Cand { ComPtr<ID3D11Resource> res; ComPtr<ID3D11ShaderResourceView> srv; uint32_t w, h; };
-                     Cand cands[16];
-                     int nc = 0;
-                     for (int i = 1; i < 16; i++)
-                     {
-                        if (!srvs[i]) continue;
-                        ID3D11Resource* tmp_res = nullptr;
-                        srvs[i]->GetResource(&tmp_res);
-                        ComPtr<ID3D11Resource> r;
-                        r.attach(tmp_res);
-                        if (!r) continue;
-                        ComPtr<ID3D11Texture2D> t;
-                        if (FAILED(r->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(t.put())))) continue;
-                        D3D11_TEXTURE2D_DESC d = {};
-                        t->GetDesc(&d);
-                        if (d.Width >= 400 && d.Format == static_cast<DXGI_FORMAT>(24) && nc < 16) // M55: was 1000
-                        {
-                           cands[nc].res = r;
-                           cands[nc].srv = srvs[i];
-                           cands[nc].w = d.Width; cands[nc].h = d.Height;
-                           nc++;
-                        }
-                     }
-                     uint64_t cur = g_hist_frame.load(std::memory_order_relaxed);
-                     int pick = -1;
-                     {
-                        std::lock_guard<std::mutex> lk(g_writer_mutex);
-                        for (int i = 0; i < nc; i++)
-                        {
-                           auto it = g_rt_last_writer.find((uint64_t)cands[i].res.get());
-                           if (it != g_rt_last_writer.end() && it->second == cur) { pick = i; break; }
-                        }
-                     }
-                     if (pick < 0 && nc > 0) pick = 0; // fallback: first
-                     if (pick >= 0)
-                     {
-                        res_color = cands[pick].res;
-                        rw = cands[pick].w; rh = cands[pick].h;
-                        // Freshness: count handle changes across runs.
-                        uint64_t hnow = (uint64_t)res_color.get();
-                        if (g_last_color_handle.exchange(hnow) != hnow)
-                           g_color_changes.fetch_add(1, std::memory_order_relaxed);
-                     }
-                     // Keep the winning view for the M9b unpack pass.
-                     if (pick >= 0)
-                        srv_color_pick = cands[pick].srv;
-                  }
-                  // Depth: first depth-format SRV at any slot, else same-frame
-                  // cache from the post family (the slot binds no depth).
-                  ComPtr<ID3D11Resource> res_depth;
-                  for (int i = 0; i < 16 && !res_depth; i++)
-                  {
-                     if (!srvs[i]) continue;
-                     ID3D11Resource* tmp_res = nullptr;
-                     srvs[i]->GetResource(&tmp_res);
-                     ComPtr<ID3D11Resource> r;
-                     r.attach(tmp_res);
-                     if (!r) continue;
-                     ComPtr<ID3D11Texture2D> t;
-                     if (FAILED(r->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(t.put())))) continue;
-                     D3D11_TEXTURE2D_DESC d = {};
-                     t->GetDesc(&d);
-                     switch (d.Format)
-                     {
-                     case DXGI_FORMAT_R24G8_TYPELESS:
-                     case DXGI_FORMAT_D24_UNORM_S8_UINT:
-                     case DXGI_FORMAT_R32G8X24_TYPELESS:
-                     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-                     case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-                     case DXGI_FORMAT_R32_FLOAT: // linear depth as texture
-                     case DXGI_FORMAT_D16_UNORM:
-                        res_depth = r;
-                        break;
-                     default: break;
-                     }
-                  }
-                  bool depth_cached = false;
-                  auto& gd_cache = *static_cast<DaysGoneDeviceData*>(device_data.game);
-                  if (!res_depth && gd_cache.cached_depth &&
-                      gd_cache.cached_depth_frame == g_hist_frame.load(std::memory_order_relaxed))
-                  {
-                     res_depth = gd_cache.cached_depth;
-                     depth_cached = true;
-                  }
-                  // Game output RT (must be UAV-bound for direct DLSS draw).
-                  ComPtr<ID3D11RenderTargetView> rtv;
-                  ID3D11RenderTargetView* raw_rtv = nullptr;
-                  native_device_context->OMGetRenderTargets(1, &raw_rtv, nullptr);
-                  rtv = raw_rtv;
-                  ComPtr<ID3D11Resource> res_out;
-                  uint32_t ow = 0, oh = 0;
-                  bool out_uav = false;
-                   if (rtv)
-                   {
-                      ID3D11Resource* tmp_out = nullptr;
-                      rtv->GetResource(&tmp_out);
-                      res_out.attach(tmp_out);
-                      ComPtr<ID3D11Texture2D> t;
-                      if (res_out && SUCCEEDED(res_out->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(t.put()))))
-                     {
-                        D3D11_TEXTURE2D_DESC d = {};
-                        t->GetDesc(&d);
-                        ow = d.Width; oh = d.Height;
-                        out_uav = (d.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0;
-                     }
-                  }
-                  for (int i = 0; i < 16; i++) { if (raw_srvs[i]) raw_srvs[i]->Release(); }
-                  if (raw_rtv) raw_rtv->Release();
-
-                  auto& gd = *static_cast<DaysGoneDeviceData*>(device_data.game);
-                  // (M10d: viewer moved to the standalone masterless block
-                  // above -- plain copy, no sRGB wash. Removed here.)
-                  bool inputs_ok = res_color && res_depth && res_out && rw && ow;
-                   // M10k: DLAA (render==output, the M7 goal) is allowed by
-                   // default. The M10 hard block on ow<=rw||oh<=rh made the M7
-                   // toggle a no-op in normal 100%-scale gameplay. Only take
-                   // the native path on a true downscale (ow<rw||oh<rh -- never
-                   // a DLSS case), or when the upscale-only guard is ticked.
-                   // Menu/map UI modes at render==output are handled by the
-                   // t0 composite (M10d, on by default).
-                   bool is_downscale = (ow < rw || oh < rh);
-                   // Cleanup: upscale-only guard retired (write-never flag;
-                   // DLAA render==output is the M7 goal, guard made it a no-op).
-                   bool blocked_by_guard = false;
-                   if (inputs_ok && (is_downscale || blocked_by_guard))
-                   {
-                      static bool logged_no_upscale = false;
-                      if (!logged_no_upscale)
-                      {
-                         logged_no_upscale = true;
-                         reshade::log::message(reshade::log::level::info,
-                            "DaysGone DLSS: non-upscale frame -- native pass (upscale-only guard).");
-                      }
-                      device_data.force_reset_sr = true;
-                      return DrawOrDispatchOverrideType::None;
-                   }
-                  if (!inputs_ok)
-                  {
-                     if (!gd.logged_capture_fail)
-                     {
-                        gd.logged_capture_fail = true;
-                        char b[160];
-                        snprintf(b, sizeof(b), "DaysGone DLSS capture FAIL: color=%d depth=%d out=%d rw=%u ow=%u",
-                           (int)(bool)res_color, (int)(bool)res_depth, (int)(bool)res_out, rw, ow);
-                        reshade::log::message(reshade::log::level::warning, b);
-                     }
-                     device_data.force_reset_sr = true;
-                  }
-                  // M9: game RT needs no UAV bind anymore (pixel copy via RTV).
-                  {
-                     // M9b: own FP16 color input (unpack fmt24 -> float).
-                     if (!gd.tex_color_in || gd.color_in_w != rw || gd.color_in_h != rh)
-                     {
-                        gd.srv_color_in.reset();
-                        gd.rtv_color_in.reset();
-                        gd.tex_color_in.reset();
-                        D3D11_TEXTURE2D_DESC cd = {};
-                        cd.Width = rw; cd.Height = rh;
-                        cd.MipLevels = 1; cd.ArraySize = 1;
-                        cd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-                        cd.SampleDesc.Count = 1;
-                        cd.Usage = D3D11_USAGE_DEFAULT;
-                        cd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-                        ComPtr<ID3D11Texture2D> ct;
-                        if (SUCCEEDED(native_device->CreateTexture2D(&cd, nullptr, ct.put())))
-                        {
-                           ComPtr<ID3D11ShaderResourceView> csrv;
-                           ComPtr<ID3D11RenderTargetView> crtv;
-                           if (SUCCEEDED(native_device->CreateShaderResourceView(ct.get(), nullptr, csrv.put())) &&
-                               SUCCEEDED(native_device->CreateRenderTargetView(ct.get(), nullptr, crtv.put())))
-                           {
-                              gd.tex_color_in = ct;
-                              gd.srv_color_in = csrv;
-                              gd.rtv_color_in = crtv;
-                              gd.color_in_w = rw; gd.color_in_h = rh;
-                           }
-                        }
-                     }
-                     // Zero-MV texture at render res (M7: real MVs at M8+).
-                     if (!gd.tex_dlss_zero_mvs || gd.zero_mvs_w != rw || gd.zero_mvs_h != rh)
-                     {
-                        gd.srv_dlss_zero_mvs.reset();
-                        gd.tex_dlss_zero_mvs.reset();
-                        D3D11_TEXTURE2D_DESC zd = {};
-                        zd.Width = rw; zd.Height = rh;
-                        zd.MipLevels = 1; zd.ArraySize = 1;
-                        zd.Format = DXGI_FORMAT_R16G16_FLOAT;
-                        zd.SampleDesc.Count = 1;
-                        zd.Usage = D3D11_USAGE_DEFAULT;
-                        zd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                        std::vector<uint8_t> zeros((size_t)rw * rh * 4, 0);
-                        D3D11_SUBRESOURCE_DATA init = {};
-                        init.pSysMem = zeros.data();
-                        init.SysMemPitch = rw * 4;
-                        ComPtr<ID3D11Texture2D> zt;
-                        if (SUCCEEDED(native_device->CreateTexture2D(&zd, &init, zt.put())))
-                        {
-                           if (SUCCEEDED(native_device->CreateShaderResourceView(zt.get(), nullptr, gd.srv_dlss_zero_mvs.put())))
-                           {
-                              gd.tex_dlss_zero_mvs = zt;
-                              gd.zero_mvs_w = rw; gd.zero_mvs_h = rh;
-                           }
-                        }
-                     }
-                     // Cleanup: M9d bypass branch retired (write-never flag;
-                     // show-input diagnostic superseded by the feed viewer).
-                     // M9i: prefer cached linear HDR (unambiguous RGB in every
-                     // mode) over the mode-dependent fmt24 pair. Decided here
-                     // so render dims + hdr flag agree downstream.
-                     // M10c: HDR only when preferred (pre-UI suspect) --
-                     // default back to pair (may carry UI).
-                     bool hdr_feed = false;
-                      if (g_prefer_hdr.load(std::memory_order_relaxed) &&
-                          gd.cached_hdr && gd.cached_hdr_frame == g_hist_frame.load(std::memory_order_relaxed) &&
-                          gd.cached_hdr_w >= 400) // M55: was 1000
-                     {
-                        hdr_feed = true;
-                     }
-                     SR::SettingsData settings_data;
-                     settings_data.output_width = ow;
-                     settings_data.output_height = oh;
-                     settings_data.render_width = rw;
-                     settings_data.render_height = rh;
-                     settings_data.dynamic_resolution = false;
-                     settings_data.hdr = hdr_feed ? true : g_dlss_hdr.load(std::memory_order_relaxed);
-                     settings_data.inverted_depth = g_inverted_depth.load(std::memory_order_relaxed);
-                     settings_data.mvs_jittered = g_mvs_jittered.load(std::memory_order_relaxed);
-                     settings_data.auto_exposure = g_dlss_autoexp.load(std::memory_order_relaxed);
-                     settings_data.render_preset = dlss_render_preset;
-                     {
-                        float mvsx = 0.0f, mvsy = 0.0f;
-                        GetMVScales((float)rw, (float)rh, mvsx, mvsy);
-                        settings_data.mvs_x_scale = mvsx;
-                        settings_data.mvs_y_scale = mvsy;
-                     }
-                     sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
-
-                     // M62: window resize (game RT changed size) => force NGX reset.
-                     // M64: render-size change counts too (render-scale slider).
-                     {
-                        uint32_t poww = g_m7_last_ow.load(std::memory_order_relaxed);
-                        uint32_t powh = g_m7_last_oh.load(std::memory_order_relaxed);
-                        uint32_t prw = g_m7_last_rw.load(std::memory_order_relaxed);
-                        uint32_t prh = g_m7_last_rh.load(std::memory_order_relaxed);
-                        if (poww && powh && (ow != poww || oh != powh || rw != prw || rh != prh))
-                        {
-                           device_data.force_reset_sr = true;
-                           char rb[128];
-                           snprintf(rb, sizeof(rb), "DaysGone M7 resize %ux%u -> %ux%u (render %ux%u): forcing NGX reset",
-                              poww, powh, ow, oh, rw, rh);
-                           reshade::log::message(reshade::log::level::info, rb);
-                        }
-                        g_m7_last_ow.store(ow, std::memory_order_relaxed);
-                        g_m7_last_oh.store(oh, std::memory_order_relaxed);
-                        g_m7_last_rw.store(rw, std::memory_order_relaxed);
-                        g_m7_last_rh.store(rh, std::memory_order_relaxed);
-                     }
-                     const bool reset = device_data.force_reset_sr || gd.first_dlss_frame;
-                     device_data.force_reset_sr = false;
-                     // M9b: unpack fmt24 game color -> own FP16 (hardware does
-                     // UNORM10 -> float on load; NGX misreads packed fmt24).
-                     // Falls back to direct feed if anything is missing.
-                     // M9c: swizzle variant selectable live (BGR-ordered data).
-                     // M9e: via RunCopyPass (forced clean state).
-                     ID3D11Resource* dlss_color = res_color.get();
-                     if (hdr_feed)
-                     {
-                        dlss_color = gd.cached_hdr.get();
-                        rw = gd.cached_hdr_w; rh = gd.cached_hdr_h;
-                     }
-                     else if (gd.tex_color_in && srv_color_pick)
-                     {
-                        if (RunCopyPass(native_device, native_device_context, device_data, gd,
-                            srv_color_pick.get(), gd.rtv_color_in.get(), rw, rh,
-                            g_swap_unpack.load(std::memory_order_relaxed), false))
-                           dlss_color = gd.tex_color_in.get();
-                     }
-                     // M9: own FP16 output target (UAV for NGX) + SRV for copy.
-                      // M64: same render>out overscan as the compute path (see
-                      // above) -- output target covers max(render, output).
-                      uint32_t odw = ow > rw ? ow : rw, odh = oh > rh ? oh : rh;
-                      if (!gd.tex_dlss_out || gd.dlss_out_w != odw || gd.dlss_out_h != odh)
-                      {
-                         gd.srv_dlss_out.reset();
-                         gd.tex_dlss_out.reset();
-                         D3D11_TEXTURE2D_DESC od = {};
-                         od.Width = odw; od.Height = odh;
-                        od.MipLevels = 1; od.ArraySize = 1;
-                        od.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-                        od.SampleDesc.Count = 1;
-                        od.Usage = D3D11_USAGE_DEFAULT;
-                        od.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-                        ComPtr<ID3D11Texture2D> ot;
-                        if (SUCCEEDED(native_device->CreateTexture2D(&od, nullptr, ot.put())))
-                        {
-                           if (SUCCEEDED(native_device->CreateShaderResourceView(ot.get(), nullptr, gd.srv_dlss_out.put())))
-                           {
-                                 gd.tex_dlss_out = ot;
-                                 gd.dlss_out_w = odw; gd.dlss_out_h = odh;
-                           }
-                        }
-                     }
-                     if (!gd.tex_dlss_out)
-                     {
-                        // No output target -- let the native TAAU run.
-                        device_data.force_reset_sr = true;
-                        return DrawOrDispatchOverrideType::None;
-                     }
-                     // M10b: sanity clamp. cb0[0] read 285x444px live -- that is
-                     // the disasm's DITHER-hash offset (feeds sincos), NOT
-                     // reprojection jitter. Real TAA jitter is a few px max.
-                     // Feeding hundreds of px smeared the frame vertically and
-                     // buried the HUD. Clamp kills the smear; true jitter
-                     // still needs the camera-CB probe (parked-car test).
-                     float jit_x = 0.0f, jit_y = 0.0f;
-                     bool jit_clamped = false;
-                     {
-                        ID3D11Buffer* cb0 = nullptr;
-                        native_device_context->PSGetConstantBuffers(0, 1, &cb0);
-                        if (cb0)
-                        {
-                           D3D11_BUFFER_DESC bd = {};
-                           cb0->GetDesc(&bd);
-                           if (bd.ByteWidth >= 112)
-                           {
-                              if (!gd.staging_cb || gd.staging_size != bd.ByteWidth)
-                              {
-                                 gd.staging_cb.reset();
-                                 D3D11_BUFFER_DESC sd = {};
-                                 sd.ByteWidth = bd.ByteWidth;
-                                 sd.Usage = D3D11_USAGE_STAGING;
-                                 sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                                 if (SUCCEEDED(native_device->CreateBuffer(&sd, nullptr, gd.staging_cb.put())))
-                                    gd.staging_size = bd.ByteWidth;
-                                 else
-                                    gd.staging_size = 0;
-                              }
-                               if (gd.staging_cb)
-                               {
-                                  native_device_context->CopySubresourceRegion(gd.staging_cb.get(), 0, 0, 0, 0, cb0, 0, nullptr);
-                                  D3D11_MAPPED_SUBRESOURCE m = {};
-                                  if (SUCCEEDED(native_device_context->Map(gd.staging_cb.get(), 0, D3D11_MAP_READ, 0, &m)) && m.pData)
-                                  {
-                                     const float* f = (const float*)m.pData;
-                                     // Cleanup: M10f full-CB one-shot dump retired
-                                     // (g_dump_cb has no stores since menuclean;
-                                     // compute-side g_cdump_cb covers CB triage).
-                                     // M10h: real jitter = cb0[26]/[27] (1-2px, from CB dump).
-                                     // cb0[0]/[1] = dither offset (hundreds of px) -- logged only.
-                                     g_jit_rawx.store(f[26]);
-                                     g_jit_rawy.store(f[27]);
-                                     jit_x = f[26] * (float)rw;
-                                     jit_y = f[27] * (float)rh;
-                                     if (jit_x > 32.0f || jit_x < -32.0f || jit_y > 32.0f || jit_y < -32.0f)
-                                     {
-                                        jit_clamped = true;
-                                        jit_x = 0.0f; jit_y = 0.0f;
-                                        static bool logged_clamp = false;
-                                        if (!logged_clamp)
-                                        {
-                                           logged_clamp = true;
-                                           char b[160];
-                                           snprintf(b, sizeof(b), "DaysGone DLSS: cb0[26]/[27] jitter insane (%.1f,%.1f)px -- clamped to 0",
-                                              jit_x, jit_y);
-                                           reshade::log::message(reshade::log::level::warning, b);
-                                        }
-                                    }
-                                    g_jit_pxx.store(jit_x);
-                                    g_jit_pxy.store(jit_y);
-                                    native_device_context->Unmap(gd.staging_cb.get(), 0);
-                                 }
-                              }
-                           }
-                           cb0->Release();
-                        }
-                     }
-                     SR::SuperResolutionImpl::DrawData draw_data;
-                     draw_data.source_color = dlss_color;
-                     draw_data.output_color = gd.tex_dlss_out.get(); // own FP16, not game RT
-                      // M56: unified MV feed (same as M11 compute): own-camera MVs
-                      // (1/2 rot, 3/4 full with depth) take priority, then the
-                      // named/auto velocity selector, then MVConvert decode to
-                      // zero-centered pixels. The old raw fmt35 direct feed
-                      // read the 0.5 center as constant motion = shimmer.
-                      ID3D11Resource* mv_res = gd.tex_dlss_zero_mvs.get();
-                      bool mv_real = false;
-                      const char* mv_src = "zero";
-                      bool own_done = false;
-                      {
-                         int ownm = g_ownmv.load(std::memory_order_relaxed);
-                         bool own_full = (ownm == 3 || ownm == 4);
-                         if ((ownm >= 1 && ownm <= 4) && device_data.game)
-                         {
-                             auto& god = *static_cast<DaysGoneDeviceData*>(device_data.game);
-                             uint64_t oframe = g_hist_frame.load(std::memory_order_relaxed);
-                             ElectViewPick(god, oframe); // viewpick: elect+commit before use
-                             if (god.view_frame_cur == oframe && god.view_frame_prev != 0 &&
-                                god.view_frame_prev + 1 >= god.view_frame_cur)
-                            {
-                               const float* vcur = god.view_cb_cur;
-                               const float* vprv = god.view_cb_prev;
-                               float op00 = 0, op11 = 0;
-                               if ((vcur[32] > 1e-6f || vcur[32] < -1e-6f)) op00 = vcur[0] / vcur[32];
-                               if ((vcur[37] > 1e-6f || vcur[37] < -1e-6f)) op11 = vcur[5] / vcur[37];
-                               float op00_prev = 0, op11_prev = 0;
-                               if ((vprv[32] > 1e-6f || vprv[32] < -1e-6f)) op00_prev = vprv[0] / vprv[32];
-                               if ((vprv[37] > 1e-6f || vprv[37] < -1e-6f)) op11_prev = vprv[5] / vprv[37];
-                               if (op00 > 0.5f && op00 < 8.0f && op11 > 0.5f && op11 < 8.0f &&
-                                   op00_prev > 0.5f && op00_prev < 8.0f && op11_prev > 0.5f && op11_prev < 8.0f)
-                               {
-                                   if (!god.tex_mvs_conv || god.mvs_conv_w != rw || god.mvs_conv_h != rh)
-                                  {
-                                     god.srv_mvs_conv.reset();
-                                     god.rtv_mvs_conv.reset();
-                                     god.tex_mvs_conv.reset();
-                                     D3D11_TEXTURE2D_DESC od = {};
-                                      od.Width = rw; od.Height = rh;
-                                     od.MipLevels = 1; od.ArraySize = 1;
-                                     od.Format = DXGI_FORMAT_R16G16_FLOAT;
-                                     od.SampleDesc.Count = 1;
-                                     od.Usage = D3D11_USAGE_DEFAULT;
-                                     od.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-                                     ComPtr<ID3D11Texture2D> ot;
-                                     if (SUCCEEDED(native_device->CreateTexture2D(&od, nullptr, ot.put())))
-                                     {
-                                        ComPtr<ID3D11ShaderResourceView> os;
-                                        ComPtr<ID3D11RenderTargetView> orv;
-                                        if (SUCCEEDED(native_device->CreateShaderResourceView(ot.get(), nullptr, os.put())) &&
-                                            SUCCEEDED(native_device->CreateRenderTargetView(ot.get(), nullptr, orv.put())))
-                                        {
-                                           god.tex_mvs_conv = ot;
-                                           god.srv_mvs_conv = os;
-                                           god.rtv_mvs_conv = orv;
-                                           god.mvs_conv_w = rw; god.mvs_conv_h = rh;
-                                        }
-                                     }
-                                  }
-                                  if (!god.cb_ownmv)
-                                  {
-                                     D3D11_BUFFER_DESC cbd = {};
-                                      cbd.ByteWidth = 208; // M51 192B + DeltaC float3+pad (52 floats)
-                                     cbd.Usage = D3D11_USAGE_DYNAMIC;
-                                     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-                                     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-                                     native_device->CreateBuffer(&cbd, nullptr, god.cb_ownmv.put());
-                                  }
-                                  ComPtr<ID3D11ShaderResourceView> owndepth;
-                                  if (own_full && res_depth)
-                                  {
-                                     D3D11_SHADER_RESOURCE_VIEW_DESC dvd = {};
-                                     dvd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-                                     dvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                                     dvd.Texture2D.MipLevels = 1;
-                                     if (FAILED(native_device->CreateShaderResourceView(res_depth.get(), &dvd, owndepth.put())))
-                                        owndepth.reset();
-                                  }
-                                  uint32_t ownkey = (ownm == 2) ? CompileTimeStringHash("DaysGone OwnMV Neg PS")
-                                     : (ownm == 3) ? CompileTimeStringHash("DaysGone OwnMV FullA PS")
-                                     : (ownm == 4) ? CompileTimeStringHash("DaysGone OwnMV FullB PS")
-                                     : CompileTimeStringHash("DaysGone OwnMV PS");
-                                  ID3D11PixelShader* own_ps = device_data.native_pixel_shaders[ownkey].get();
-                                  ID3D11VertexShader* copy_vs2 = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
-                                  if (own_ps && copy_vs2 && god.rtv_mvs_conv && god.cb_ownmv && (!own_full || owndepth))
-                                  {
-                                     D3D11_MAPPED_SUBRESOURCE cmo = {};
-                                     if (SUCCEEDED(native_device_context->Map(god.cb_ownmv.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &cmo)) && cmo.pData)
-                                     {
-                                        float* of = (float*)cmo.pData;
-                                        memcpy(of, vcur + 32, 64);
-                                        memcpy(of + 16, vprv + 32, 64);
-                                        memcpy(of + 32, vcur + 172, 16);
-                                        memcpy(of + 36, vprv + 172, 16);
-                                        of[40] = op00; of[41] = op11;
-                                        of[42] = (float)rw; of[43] = (float)rh;
-                                        of[44] = 10.0f; of[45] = op00_prev; of[46] = op11_prev; of[47] = 0.0f;
-                                        // DeltaC (Full-B): Ccur-Cprev in DOUBLE on CPU (see compute site).
-                                        of[48] = (float)((double)vcur[172] - (double)vprv[172]);
-                                        of[49] = (float)((double)vcur[173] - (double)vprv[173]);
-                                        of[50] = (float)((double)vcur[174] - (double)vprv[174]);
-                                        of[51] = 0.0f;
-                                        native_device_context->Unmap(god.cb_ownmv.get(), 0);
-                                        DrawStateStack<DrawStateStackType::FullGraphics> own_cs;
-                                        own_cs.Cache(native_device_context, device_data.uav_max_count);
-                                        ID3D11UnorderedAccessView* null_uavs[D3D11_1_UAV_SLOT_COUNT] = {};
-                                        native_device_context->CSSetUnorderedAccessViews(0, device_data.uav_max_count, null_uavs, nullptr);
-                                        D3D11_VIEWPORT vp = {};
-                                        vp.TopLeftX = 0.0f; vp.TopLeftY = 0.0f;
-                                        vp.Width = (float)rw; vp.Height = (float)rh;
-                                        vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
-                                        native_device_context->RSSetViewports(1, &vp);
-                                        native_device_context->RSSetState(god.rs_copy.get());
-                                        native_device_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
-                                        native_device_context->OMSetDepthStencilState(nullptr, 0);
-                                        native_device_context->OMSetRenderTargets(1, &god.rtv_mvs_conv, nullptr);
-                                        native_device_context->VSSetShader(copy_vs2, nullptr, 0);
-                                        native_device_context->PSSetShader(own_ps, nullptr, 0);
-                                        ID3D11Buffer* owncb = god.cb_ownmv.get();
-                                        native_device_context->PSSetConstantBuffers(0, 1, &owncb);
-                                        if (own_full)
-                                        {
-                                           ID3D11ShaderResourceView* odsv = owndepth.get();
-                                           native_device_context->PSSetShaderResources(0, 1, &odsv);
-                                        }
-                                        native_device_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                                        native_device_context->Draw(4, 0);
-                                        ID3D11Buffer* nullcb = nullptr;
-                                        native_device_context->PSSetConstantBuffers(0, 1, &nullcb);
-                                        if (own_full)
-                                        {
-                                           ID3D11ShaderResourceView* nullsrv = nullptr;
-                                           native_device_context->PSSetShaderResources(0, 1, &nullsrv);
-                                        }
-                                        own_cs.Restore(native_device_context);
-                                        mv_res = god.tex_mvs_conv.get();
-                                        mv_real = true;
-                                        mv_src = (ownm == 2) ? "own-rot-neg" : (ownm == 3) ? "own-fullA" : (ownm == 4) ? "own-fullB" : "own-rot";
-                                        own_done = true;
-                                        g_clast_ownguard.store(0, std::memory_order_relaxed); // log-only: own-fed-ok
-                                        g_own_p00.store(op00, std::memory_order_relaxed);
-                                        g_own_p11.store(op11, std::memory_order_relaxed);
-                                        g_own_used.store(ownm, std::memory_order_relaxed);
-                                     }
-                                  }
-                               }
-                               else // log-only: projection shape reject
-                                  g_clast_ownguard.store(3, std::memory_order_relaxed);
-                            }
-                            else // log-only: election hold (1) vs pairing fail (2)
-                            {
-                               if (god.view_frame_cur != oframe)
-                                  g_clast_ownguard.store(1, std::memory_order_relaxed);
-                               else
-                                  g_clast_ownguard.store(2, std::memory_order_relaxed);
-                            }
-                         }
-                         else // log-only: own-mode-off
-                            g_clast_ownguard.store(4, std::memory_order_relaxed);
-                      }
-                      if (!own_done && !g_zero_mv.load(std::memory_order_relaxed))
-                      {
-                         ID3D11Resource* mv_sel = nullptr;
-                         const char* mv_sel_name = "cache";
-                         int mvmode = g_mv_src_mode.load(std::memory_order_relaxed);
-                         if (mvmode >= 1 && mvmode <= 6)
-                         {
-                            uint32_t want = kMvHashes[mvmode - 1];
-                            std::lock_guard<std::mutex> mlk(g_mvmap_mutex);
-                            auto it = g_mv_by_hash.find(want);
-                            if (it != g_mv_by_hash.end() && it->second.frame == g_hist_frame.load(std::memory_order_relaxed) && it->second.res)
-                            { mv_sel = it->second.res.get(); mv_sel_name = kMvNames[mvmode - 1]; }
-                         }
-                         else if (gd.cached_mvs && gd.cached_mvs_frame == g_hist_frame.load(std::memory_order_relaxed))
-                         { mv_sel = gd.cached_mvs.get(); mv_sel_name = "cache"; }
-                         if (mv_sel)
-                         {
-                            int mvdec = g_mv_decode.load(std::memory_order_relaxed);
-                            if (mvdec != 0)
-                            {
-                               if (!gd.tex_mvs_conv || gd.mvs_conv_w != rw || gd.mvs_conv_h != rh)
-                               {
-                                  gd.srv_mvs_conv.reset();
-                                  gd.rtv_mvs_conv.reset();
-                                  gd.tex_mvs_conv.reset();
-                                  D3D11_TEXTURE2D_DESC md = {};
-                                  md.Width = rw; md.Height = rh;
-                                  md.MipLevels = 1; md.ArraySize = 1;
-                                  md.Format = DXGI_FORMAT_R16G16_FLOAT;
-                                  md.SampleDesc.Count = 1;
-                                  md.Usage = D3D11_USAGE_DEFAULT;
-                                  md.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-                                  ComPtr<ID3D11Texture2D> mt;
-                                  if (SUCCEEDED(native_device->CreateTexture2D(&md, nullptr, mt.put())))
-                                  {
-                                     ComPtr<ID3D11ShaderResourceView> ms;
-                                     ComPtr<ID3D11RenderTargetView> mr;
-                                     if (SUCCEEDED(native_device->CreateShaderResourceView(mt.get(), nullptr, ms.put())) &&
-                                         SUCCEEDED(native_device->CreateRenderTargetView(mt.get(), nullptr, mr.put())))
-                                     {
-                                        gd.tex_mvs_conv = mt;
-                                        gd.srv_mvs_conv = ms;
-                                        gd.rtv_mvs_conv = mr;
-                                        gd.mvs_conv_w = rw; gd.mvs_conv_h = rh;
-                                     }
-                                  }
-                               }
-                               if (gd.rtv_mvs_conv)
-                               {
-                                  uint32_t mvkey = (mvdec == 2) ? CompileTimeStringHash("DaysGone MV Convert 025 PS")
-                                     : (mvdec == 3) ? CompileTimeStringHash("DaysGone MV Convert Zero PS")
-                                     : (mvdec == 4) ? CompileTimeStringHash("DaysGone MV Convert Neg PS")
-                                     : (mvdec == 5) ? CompileTimeStringHash("DaysGone MV Convert Zero025 PS")
-                                     : (mvdec == 6) ? CompileTimeStringHash("DaysGone MV Convert NegZero PS")
-                                     : (mvdec == 7) ? CompileTimeStringHash("DaysGone MV Convert YNegZero PS")
-                                     : (mvdec == 8) ? CompileTimeStringHash("DaysGone MV Convert XNegZero PS")
-                                     : CompileTimeStringHash("DaysGone MV Convert PS");
-                                  ID3D11PixelShader* mv_ps = device_data.native_pixel_shaders[mvkey].get();
-                                  ID3D11VertexShader* copy_vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
-                                  ComPtr<ID3D11ShaderResourceView> cached_mv_srv;
-                                  if (mv_ps && copy_vs && SUCCEEDED(native_device->CreateShaderResourceView(mv_sel, nullptr, cached_mv_srv.put())))
-                                  {
-                                     DrawStateStack<DrawStateStackType::FullGraphics> mv_cs;
-                                     mv_cs.Cache(native_device_context, device_data.uav_max_count);
-                                     ID3D11UnorderedAccessView* null_uavs[D3D11_1_UAV_SLOT_COUNT] = {};
-                                     native_device_context->CSSetUnorderedAccessViews(0, device_data.uav_max_count, null_uavs, nullptr);
-                                     D3D11_VIEWPORT vp = {};
-                                     vp.TopLeftX = 0.0f; vp.TopLeftY = 0.0f;
-                                     vp.Width = (float)rw; vp.Height = (float)rh;
-                                     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
-                                     native_device_context->RSSetViewports(1, &vp);
-                                     native_device_context->RSSetState(gd.rs_copy.get());
-                                     native_device_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
-                                     native_device_context->OMSetDepthStencilState(nullptr, 0);
-                                     native_device_context->OMSetRenderTargets(1, &gd.rtv_mvs_conv, nullptr);
-                                     native_device_context->VSSetShader(copy_vs, nullptr, 0);
-                                     native_device_context->PSSetShader(mv_ps, nullptr, 0);
-                                     native_device_context->PSSetShaderResources(0, 1, &cached_mv_srv);
-                                     native_device_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                                     native_device_context->Draw(4, 0);
-                                     mv_cs.Restore(native_device_context);
-                                     mv_res = gd.tex_mvs_conv.get();
-                                     mv_real = true;
-                                     mv_src = mv_sel_name;
-                                  }
-                               }
-                            }
-                            else
-                            {
-                               mv_res = mv_sel;
-                               mv_real = true;
-                               mv_src = mv_sel_name;
-                            }
-                          }
-                       }
-                       // log-only: fell back to game MVs (5) or zero (6)
-                       if (!own_done)
-                          g_clast_ownguard.store(mv_real ? 5 : 6, std::memory_order_relaxed);
-                       draw_data.motion_vectors = mv_res;
-                       // Cleanup: g_no_depth branch retired (write-never flag).
-                       draw_data.depth_buffer = res_depth.get();
-                     draw_data.render_width = rw;
-                     draw_data.render_height = rh;
-                     draw_data.reset = reset;
-                      draw_data.near_plane = g_near_plane.load(std::memory_order_relaxed);
-                      draw_data.far_plane = g_far_plane.load(std::memory_order_relaxed);
-                      draw_data.vert_fov = g_vert_fov.load(std::memory_order_relaxed);
-                     draw_data.jitter_x = 0.0f; // replaced below (M10)
-                     draw_data.jitter_y = 0.0f;
-                      // Cleanup: g_jitter_off conjunct retired (write-never flag).
-                      if (g_jitter_on.load(std::memory_order_relaxed))
-                      {
-                        float pjs = GetJitScale();
-                        draw_data.jitter_x = (g_jit_flip_x.load(std::memory_order_relaxed) ? 1.0f : -1.0f) * jit_x * pjs;
-                        draw_data.jitter_y = (g_jit_flip_y.load(std::memory_order_relaxed) ? 1.0f : -1.0f) * jit_y * pjs;
-                      }
-                     draw_data.frame_index = cb_luma_global_settings.FrameIndex;
-                     // M59: store the exact NGX inputs (named feed viewer).
-                     // M60: snapshot + mv_real + depth tag (frozen truth).
-                     const char* m7dsrc = (res_depth && gd.cached_depth && res_depth.get() == gd.cached_depth.get())
-                        ? "cache-DSV" : "slot-depth";
-                     StoreFeed(1, dlss_color, res_depth.get(), mv_res, gd.tex_dlss_out.get(),
-                        native_device, native_device_context, mv_real, m7dsrc);
-                     const bool ok = ([&]() {
-                        // M7f: match upstream Unreal DLSS path -- full graphics
-                        // + compute state cover, Replaced (not Skip). M7's
-                        // Skip left core bookkeeping/state dangling behind a
-                        // cancelled pixel draw = frozen/garbage presentation.
-                        DrawStateStack<DrawStateStackType::FullGraphics> draw_st;
-                        draw_st.Cache(native_device_context, device_data.uav_max_count);
-                        DrawStateStack<DrawStateStackType::Compute> st;
-                        st.Cache(native_device_context, device_data.uav_max_count);
-                        const bool r = sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data);
-                        st.Restore(native_device_context);
-                        draw_st.Restore(native_device_context);
-                        return r;
-                     })();
-                      if (!gd.logged_draw_result)
-                      {
-                         gd.logged_draw_result = true;
-                         int mvfmt0 = -1;
-                         {
-                            ComPtr<ID3D11Texture2D> q0;
-                            if (mv_res && SUCCEEDED(mv_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(q0.put()))))
-                            {
-                               D3D11_TEXTURE2D_DESC qd0 = {};
-                               q0->GetDesc(&qd0);
-                               mvfmt0 = (int)qd0.Format;
-                            }
-                         }
-                         char b[320];
-                         snprintf(b, sizeof(b), "DaysGone DLSS first Draw ok=%d reset=%d render=%ux%u out=%ux%u sr=%s depth_cached=%d mv_real=%d mvsrc=%s mvfmt=%d dec=%d msc=%d inv=%d hdr_feed=%d (M56 unified)",
-                            (int)ok, (int)reset, rw, rh, ow, oh, SrTypeName(device_data.sr_type), (int)depth_cached, (int)mv_real, mv_src, mvfmt0,
-                            g_mv_decode.load(std::memory_order_relaxed), g_mv_scale_mode.load(std::memory_order_relaxed), (int)g_inverted_depth.load(std::memory_order_relaxed), (int)hdr_feed);
-                         reshade::log::message(reshade::log::level::info, b);
-                      }
-                      // Cleanup: M56 M7 feed-identity + M57 M7 stats one-shots
-                      // retired (g_m7feed/g_m7stats have no stores since
-                      // menuclean; shared AUDIT + compute cSTATS below cover
-                      // both paths).
-                      // M57: audit every requested feed (both paths share the sequence).
-                      {
-                         int mvfmtA = -1;
-                         {
-                            ComPtr<ID3D11Texture2D> qA;
-                            if (mv_res && SUCCEEDED(mv_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(qA.put()))))
-                            {
-                               D3D11_TEXTURE2D_DESC qdA = {};
-                               qA->GetDesc(&qdA);
-                               mvfmtA = (int)qdA.Format;
-                            }
-                         }
-                         if (g_audit_left.load(std::memory_order_relaxed) > 0)
-                         {
-                            LogAuditFeed("M7", dlss_color, res_depth.get(), mv_res, mv_src, mvfmtA,
-                               rw, rh, ow, oh, hdr_feed, reset, draw_data.jitter_x, draw_data.jitter_y, ok);
-                            g_audit_left.fetch_sub(1, std::memory_order_relaxed);
-                         }
-                      }
-                      if (ok)
-                      {
-                         // M9 copy: FP16 DLSS result -> game RTV (M9e: forced
-                         // clean state inside RunCopyPass).
-                         // M57: keep_alpha=true (M11 parity; M7 wrote alpha 0).
-                         bool copied = false;
-                         if (rtv)
-                         {
-                            copied = RunCopyPass(native_device, native_device_context, device_data, gd,
-                               gd.srv_dlss_out.get(), rtv.get(), ow, oh,
-                               g_swap_output.load(std::memory_order_relaxed), !g_plain_output.load(std::memory_order_relaxed),
-                               -1, true);
-                            if (reset)
-                               g_dlss_resets.fetch_add(1, std::memory_order_relaxed);
-                           if (!copied)
-                           {
-                              static bool logged_no_copy = false;
-                              if (!logged_no_copy)
-                              {
-                                 logged_no_copy = true;
-                                 reshade::log::message(reshade::log::level::warning,
-                                    "DaysGone DLSS: copy failed -- native TAAU.");
-                              }
-                           }
-                        }
-                        if (!copied)
-                        {
-                           // Copy failed -- native TAAU runs below.
-                           device_data.force_reset_sr = true;
-                        }
-                        else
-                        {
-                           // M10d: t0 UI composite (user: UI is t0). DLSS feeds
-                           // t1/t2 scene color, so t0 UI would be wiped -- draw
-                           // it back over the copy. Size-gated inside (1x1
-                           // params t0 = no-op). Best effort: a failed composite
-                           // still returns Skip with the scene frame.
-                           if (g_composite_ui.load(std::memory_order_relaxed) && srvs[0])
-                              RunUIComposite(native_device, native_device_context, device_data, gd,
-                                 srvs[0].get(), rtv.get(), ow, oh);
-                           gd.first_dlss_frame = false;
-                           gd.dlss_runs++;
-                           g_dlss_runs.fetch_add(1, std::memory_order_relaxed);
-                           if (g_mark_sr.load(std::memory_order_relaxed))
-                              device_data.has_drawn_sr = true;
-                           // M8c: Skip cancels the native pixel draw (verified:
-                           // Replaced re-runs native here). Full state guards stay.
-                           return DrawOrDispatchOverrideType::Skip;
-                        }
-                     }
-                     device_data.force_reset_sr = true;
-                  }
+                  logged_stub = true;
+                  reshade::log::message(reshade::log::level::info,
+                     "DaysGone M7: pixel path stubbed -- native TAAU runs, M11 only.");
                }
             }
 #else
@@ -4866,7 +3670,7 @@ public:
          if (down_trace && !prev_trace)
          {
             // Tracefix: never re-arm while running; never arm with viewers on
-            // (same gate as the bundle buttons); clamp N to 30..300.
+            // (same gate as the bundle buttons); clamp N to 30..1200.
             if (g_fulltrace_frames_left.load(std::memory_order_relaxed) > 0)
                reshade::log::message(reshade::log::level::info, "DaysGone HOTKEY trace already running");
             else if (g_view_src.load(std::memory_order_relaxed) >= 0 ||
@@ -4878,7 +3682,7 @@ public:
             {
                int ttn = g_fulltrace_n.load(std::memory_order_relaxed);
                if (ttn < 30) ttn = 30;
-               if (ttn > 300) ttn = 300;
+               if (ttn > 1200) ttn = 1200;
                g_fulltrace_frames_left.store(ttn, std::memory_order_relaxed);
                g_fulltrace.store(true, std::memory_order_relaxed);
                char hb[64] = {};
@@ -5512,26 +4316,14 @@ public:
               g_clog_slot.store(true, std::memory_order_relaxed);
            if (ImGui::Button("Dump compute TAA CB0 floats"))
               g_cdump_cb.store(true, std::memory_order_relaxed);
-           if (ImGui::CollapsingHeader("Advanced scans (may hitch)"))
+           if (ImGui::CollapsingHeader("Advanced scans (retired)"))
            {
-              ImGui::TextWrapped("WARNING: these stall the GPU for a scan during gameplay. Press once in gameplay, then check ReShade.log.");
-              if (ImGui::Button("Scan TAA CBs for projection matrices"))
-                 g_cscan_cb.store(true, std::memory_order_relaxed);
-              if (ImGui::Button("Scan velocity-pass CBs (VS+PS)"))
-                 g_pscan_cb.store(true, std::memory_order_relaxed);
-              if (ImGui::Button("Sniff VS CBs for shared matrices (brief hitch)"))
-              {
-                 g_mscan_n = 0;
-                 g_mscan_sniffs = 0;
-                 MScanResetLoc();
-                 g_mscan_frame0 = g_hist_frame.load(std::memory_order_relaxed);
-                 g_mscan_cb.store(true, std::memory_order_relaxed);
-              }
+              ImGui::TextWrapped("Deep1: TAA/velocity/VS matrix scans retired -- matrices proven (rotation-only stash + Full-B campos-T feed). Use Audit + Stats + full-trace instead.");
            }
             // Full-trace master switch (all configs). Bounded: 1 line/present
             // to full.log + ReShade.log mirror; never per-draw (5700 draws
-            // per frame would explode the file). Tracefix: N clamped 30..300
-            // (~5s max), no re-arm while running, viewers-OFF gate like the
+            // per frame would explode the file). Tracefix: N clamped 30..1200
+            // (~20s max), no re-arm while running, viewers-OFF gate like the
             // bundle buttons (FULL itself is atomics-only, but the bundle
             // pairs it with pics/passes that SKIP while viewers are armed).
             {
@@ -5551,7 +4343,7 @@ public:
                      {
                         int cn = g_fulltrace_n.load(std::memory_order_relaxed);
                         if (cn < 30) cn = 30;
-                        if (cn > 300) cn = 300;
+                        if (cn > 1200) cn = 1200;
                         g_fulltrace_frames_left.store(cn, std::memory_order_relaxed);
                      }
                   }
@@ -5560,10 +4352,10 @@ public:
                   g_fulltrace.store(ft, std::memory_order_relaxed);
                }
                int nn = g_fulltrace_n.load(std::memory_order_relaxed);
-               if (ImGui::InputInt("full-trace N presents (30-300, ~5s=300)", &nn))
+               if (ImGui::InputInt("full-trace N presents (30-1200, ~20s=1200)", &nn))
                {
                   if (nn < 30) nn = 30;
-                  if (nn > 300) nn = 300;
+                  if (nn > 1200) nn = 1200;
                   g_fulltrace_n.store(nn, std::memory_order_relaxed);
                }
                if (running)
@@ -5574,7 +4366,7 @@ public:
                {
                   int cn2 = g_fulltrace_n.load(std::memory_order_relaxed);
                   if (cn2 < 30) cn2 = 30;
-                  if (cn2 > 300) cn2 = 300;
+                  if (cn2 > 1200) cn2 = 1200;
                   g_fulltrace_frames_left.store(cn2, std::memory_order_relaxed);
                   g_fulltrace.store(true, std::memory_order_relaxed);
 #if !(TEST || DEVELOPMENT)
@@ -5643,9 +4435,9 @@ public:
 #if TEST || DEVELOPMENT
               g_cap_frames_left.store(3);
 #endif
-              int tn = g_fulltrace_n.load(std::memory_order_relaxed);
+               int tn = g_fulltrace_n.load(std::memory_order_relaxed);
                if (tn < 30) tn = 30;
-               if (tn > 300) tn = 300;
+               if (tn > 1200) tn = 1200;
                // Tracefix: bundle button already requires viewers-OFF to press;
                // still never re-arm a running trace (keeps its countdown).
                if (g_fulltrace_frames_left.load(std::memory_order_relaxed) <= 0)
@@ -5702,27 +4494,62 @@ static void WriteLoadMarker(HMODULE hModule, const char* phase)
 
 #if TEST || DEVELOPMENT
 // templog: shared full.log appender (FULL + FULLAGG, behavior identical).
-static void AppendFullLogLine(HMODULE hModule, const char* text)
+// Trace1200: batched appender. Per-present open/append/close hitched the
+// present thread over long runs (N=1200 ~= 20s of file IO); lines now batch
+// into 32KB and flush when full, every 60 presents, or at run end. Truncation
+// can never fail-fast (_snprintf_s/_TRUNCATE everywhere). The per-present
+// ReShade.log mirror stays complete, so even an aborted run's unflushed tail
+// is still in ReShade.log. Silent-fail parity on IO errors (as before).
+static void FlushFullLogBuffer(HMODULE hModule, char* acc, size_t* pn)
 {
-   if (hModule == nullptr) return;
+   if (hModule == nullptr || acc == nullptr || pn == nullptr || *pn == 0)
+      return;
    char path[MAX_PATH] = {};
    DWORD len = GetModuleFileNameA(hModule, path, MAX_PATH - 32);
    char* slash = (len == 0 || len >= MAX_PATH - 32) ? nullptr : strrchr(path, '\\');
-   if (slash != nullptr)
+   if (slash == nullptr)
+      return;
+   strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "Luma-DaysGone-full.log");
+   HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+   if (f == INVALID_HANDLE_VALUE)
+      return;
+   DWORD written = 0;
+   WriteFile(f, acc, (DWORD)*pn, &written, nullptr);
+   CloseHandle(f);
+   *pn = 0;
+}
+static void AppendFullLogLine(HMODULE hModule, const char* text)
+{
+   if (hModule == nullptr || text == nullptr) return;
+   static char acc[32768] = {};
+   static size_t acc_n = 0;
+   static int since_flush = 0;
+   static int last_left = 0;
+   // Trace1200: FULL line can approach 2KB as BUILD_ID + session counters
+   // grow; the old 1024B sprintf_s fail-fasted past 1024. 4096B + TRUNCATE
+   // makes overflow structurally impossible (truncates, never crashes).
+   char tmp[4096] = {};
+   _snprintf_s(tmp, _countof(tmp), _TRUNCATE, "%s\r\n", text);
+   size_t tl = strlen(tmp);
+   if (tl == 0)
+      return;
+   int left = g_fulltrace_frames_left.load(std::memory_order_relaxed);
+   if (left > last_left && acc_n > 0)
+      FlushFullLogBuffer(hModule, acc, &acc_n); // new run: flush aborted-run tail first
+   last_left = left;
+   if (acc_n + tl > sizeof(acc))
+      FlushFullLogBuffer(hModule, acc, &acc_n);
+   if (acc_n + tl <= sizeof(acc))
    {
-      strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "Luma-DaysGone-full.log");
-      HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-      if (f != INVALID_HANDLE_VALUE)
-      {
-         // Tracefix: FULL line is up to 1408B (line[1408] at the call site) +
-         // CRLF; the old 1024B buffer made sprintf_s hit its invalid-parameter
-         // handler (fail-fast crash, worse with every BUILD_ID suffix bump).
-         char fline[2048] = {};
-         sprintf_s(fline, "%s\r\n", text);
-         DWORD written = 0;
-         WriteFile(f, fline, (DWORD)strlen(fline), &written, nullptr);
-         CloseHandle(f);
-      }
+      memcpy(acc + acc_n, tmp, tl);
+      acc_n += tl;
+      since_flush++;
+   }
+   // Flush cadence: every 60 presents, at run end, or when the buffer filled.
+   if (since_flush >= 60 || left <= 1)
+   {
+      FlushFullLogBuffer(hModule, acc, &acc_n);
+      since_flush = 0;
    }
 }
 #endif
@@ -6307,9 +5134,12 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
       snprintf(cvst, sizeof(cvst), "%d:%s%s%s", cvsrc, cvok ? "ok" : "fail:",
          cvok ? "" : (cvreason[0] ? cvreason : "unknown"));
    // Worst-case growth of the new view-filter fields is ~60 chars; buffers
-   // sized so the margin over the true worst case stays >= 128 (snprintf
+   // sized so the margin over the true worst case stays >= 400 (snprintf
    // stays sizeof-bounded regardless -- no repeat of the old overflow).
-   char line[1408] = {};
+   // Trace1200: worst case ~1.6KB absolute (40 numeric fields at 20 digits
+   // + ~320B BUILD_ID headroom + mvsrc/cvst); 2048 keeps full fidelity with
+   // margin. snprintf stays truncation-safe regardless -- never fail-fast.
+   char line[2048] = {};
    snprintf(line, sizeof(line),
       "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu dskip=%llu cc=%llu",
       (unsigned long long)present, DG_BUILD_ID,
@@ -6325,44 +5155,14 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    (void)hModule;
 #endif
    {
-      char rline[1472] = {};
+      // Trace1200: mirror sized for the grown line[] (14 + 2047); snprintf
+      // truncates safely if a freak session ever exceeds it (mirror only).
+      char rline[2112] = {};
       snprintf(rline, sizeof(rline), "DaysGone FULL %s", line);
       reshade::log::message(reshade::log::level::info, rline);
    }
-   // templog: FULLAGG window aggregate every 600 presents (log-only,
-   // read-and-reset; accumulators update in feed/commit paths only).
-   if (present % 600 == 0)
-   {
-      uint64_t wstart = (present >= 599) ? present - 599 : 0;
-      uint64_t jn = g_agg_jitn.exchange(0, std::memory_order_relaxed);
-      int64_t jsx = g_agg_jitsumx.exchange(0, std::memory_order_relaxed);
-      int64_t jsy = g_agg_jitsumy.exchange(0, std::memory_order_relaxed);
-      uint64_t q00 = g_agg_q00.exchange(0, std::memory_order_relaxed);
-      uint64_t q01 = g_agg_q01.exchange(0, std::memory_order_relaxed);
-      uint64_t q10 = g_agg_q10.exchange(0, std::memory_order_relaxed);
-      uint64_t q11 = g_agg_q11.exchange(0, std::memory_order_relaxed);
-      uint64_t rn = g_agg_rotn.exchange(0, std::memory_order_relaxed);
-      int64_t rsum = g_agg_rotsum.exchange(0, std::memory_order_relaxed);
-      int64_t rmax = g_agg_rotmax.exchange(0, std::memory_order_relaxed);
-      uint64_t ars = g_agg_resets.exchange(0, std::memory_order_relaxed);
-      uint64_t apr = g_agg_projrej.exchange(0, std::memory_order_relaxed);
-      double jmx = jn ? (double)jsx / 1000.0 / (double)jn : 0.0;
-      double jmy = jn ? (double)jsy / 1000.0 / (double)jn : 0.0;
-      double rmean = rn ? (double)rsum / 1000.0 / (double)rn : 0.0;
-      double rmaxv = (double)rmax / 1000.0;
-      char aline[512] = {};
-      snprintf(aline, sizeof(aline),
-         "DaysGone FULLAGG presents=%llu-%llu jit_n=%llu mean=%.3f,%.3f quad00/01/10/11=%llu/%llu/%llu/%llu rot_mean=%.4f rot_max=%.4f resets=%llu projrej=%llu cfg=%d.%d.%d.%d",
-         (unsigned long long)wstart, (unsigned long long)present,
-         (unsigned long long)jn, jmx, jmy,
-         (unsigned long long)q00, (unsigned long long)q01, (unsigned long long)q10, (unsigned long long)q11,
-         rmean, rmaxv, (unsigned long long)ars, (unsigned long long)apr,
-         cown, cmsc, cmvsjit, cdec);
-      reshade::log::message(reshade::log::level::info, aline);
-#if TEST || DEVELOPMENT
-      AppendFullLogLine(hModule, aline);
-#endif
-   }
+   // Deep1: FULLAGG window aggregate deleted (accumulators retired above;
+   // single FULL 300-frame + AUDIT + cSTATS cover diagnosis).
 }
 
 #if TEST || DEVELOPMENT
