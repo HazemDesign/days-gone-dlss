@@ -34,7 +34,7 @@
 #define DG_HOTKEY_DLSS VK_F9
 #define DG_HOTKEY_TRACE VK_F10
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid-menuclean-mvraw-tracefix-cleanup-resfix-deep1-m7stub-trace1200";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid-menuclean-mvraw-tracefix-cleanup-resfix-deep1-m7stub-trace1200-fov688-realfix-claudefix-depthangle-claude2";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -359,6 +359,12 @@ static char g_clast_mvsrc[32] = {};
 static std::atomic<int> g_clast_ownguard{ 4 };
 static std::atomic<unsigned long long> g_clast_vfcur{ 0 }, g_clast_vfprev{ 0 }, g_clast_oframe{ 0 };
 static std::atomic<float> g_clast_jitx{ 0.0f }, g_clast_jity{ 0.0f };
+// Round2: jitter source fed to NGX (0 = CB slot, 1 = proj-side fallback).
+static std::atomic<int> g_clast_jsrc{ 0 };
+// Round2: depth-pick refusal reason (0=cache-fed, 1=t1-fed, 2=cache-stale,
+// 3=cache-size, 4=t1-format, 5=t1-size, 6=none-native). Frequent 6 in normal
+// orbit = over-strict filter (watch this before tightening further).
+static std::atomic<int> g_clast_dreason{ -1 };
 // M11 one-shot compute-slot tools (masterless): I/O logger + CB0 dumper.
 static std::atomic<bool> g_clog_slot{ false };
 static std::atomic<bool> g_cdump_cb{ false };
@@ -443,6 +449,16 @@ static std::atomic<int> g_view_pick_snap{ -1 };
 static std::atomic<int> g_view_npool_snap{ 0 };
 static std::atomic<float> g_view_rotmag{ 0.0f };
 static std::atomic<uint64_t> g_clast_dage{ 0 };
+// Realfix: fed-depth WxH for the FULL line (see depth resolve site).
+static std::atomic<uint32_t> g_clast_ddw{ 0 }, g_clast_ddh{ 0 };
+// Realfix-claude: per-frame TCur/TPrev row hashes (TPrev(n)==TCur(n-1)
+// bitwise assert lives offline: compare tph against the previous FED
+// frame's th using vfp/fidx stamps).
+static std::atomic<uint32_t> g_clast_th{ 0 }, g_clast_tph{ 0 };
+// Round2: rotation-block checksums (R rows are jitter-free by construction;
+// rph(n)==rh(n-1) is the stash-level continuity assert; main-view check
+// below uses committed p00/p11 vs render aspect instead).
+static std::atomic<uint32_t> g_clast_rck{ 0 }, g_clast_rpck{ 0 };
 // (Deep1: g_agg_* FULLAGG accumulators deleted; see note above.)
 // viewfilter: FNV-1a over the 64B R block (cb+32) identifying a pooled view.
 static uint32_t ViewPickCksum(const float* cb)
@@ -450,6 +466,15 @@ static uint32_t ViewPickCksum(const float* cb)
    const uint8_t* b = (const uint8_t*)(cb + 32);
    uint32_t h = 2166136261u;
    for (int i = 0; i < 64; i++) { h ^= b[i]; h *= 16777619u; }
+   return h;
+}
+// Realfix-claude: FNV-1a over arbitrary bytes (per-frame TCur/TPrev identity
+// for FULL th/tph; retired with pSCAN, restored for this single use).
+static uint32_t Fnv1aBytes(const void* p, size_t n)
+{
+   const uint8_t* b = (const uint8_t*)p;
+   uint32_t h = 2166136261u;
+   for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
    return h;
 }
 // viewpick commit: legacy stash commit (ex-1933-1939) + election bookkeeping.
@@ -645,6 +670,8 @@ static std::mutex g_mvmap_mutex;
 struct MvBuf { ComPtr<ID3D11Resource> res; uint64_t frame = 0; };
 static std::unordered_map<uint32_t, MvBuf> g_mv_by_hash;
 static std::atomic<int> g_mv_src_mode{ 0 };
+// Round2: hybrid game/own dims-mismatch counter (0 = always matched).
+static std::atomic<uint64_t> g_hybdim_mismatch{ 0 };
 // Hybrid MVs (M11/compute only): game truth where nonzero, own fill where
 // cleared. Default OFF (pure game/own/zero feeds as today).
 static std::atomic<bool> g_hybrid_mv{ false };
@@ -833,6 +860,7 @@ static bool CreateDepthViewSRV(ID3D11Device* dev, ID3D11Resource* res, ComPtr<ID
       D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
       vd.Format = tryfmts[i];
       vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+      vd.Texture2D.MostDetailedMip = 0; // Realfix-claude: always mip0/base.
       vd.Texture2D.MipLevels = 1;
       if (SUCCEEDED(dev->CreateShaderResourceView(res, &vd, out.put())))
          return true;
@@ -858,7 +886,7 @@ static std::atomic<int> g_adiag_feed{ 0 };
 static std::atomic<int> g_audit_left{ 0 };
 static std::atomic<uint64_t> g_audit_seq{ 0 };
 static std::atomic<uint64_t> g_dlss_resets{ 0 }; // M57: M7 reset counter (M11 has g_cdlss_resets)
-static std::atomic<float> g_vert_fov{ 1.047f }; // M57: was hardcoded 60deg; proven view ~39.4deg=0.688
+static std::atomic<float> g_vert_fov{ 0.688f }; // Deepclean-fov688: default proven ~39.4deg (was 60deg=1.047 slider legacy; menu slider still live 0.4-1.2)
 static std::atomic<bool> g_m7stats{ false }; // M57: one-shot M7 pixel-input signal stats
 
 // M15/M30: MV scale is 1.0 pass-through, always (upstream parity -- the MV
@@ -982,6 +1010,107 @@ static void LogResStats(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Resou
    reshade::log::message(reshade::log::level::info, b);
 }
 
+// Realfix-claude: decode one depth texel to [0,1]-ish value. Shared by the
+// stats pass and the below-mean pass below (reversed-Z shape check).
+static bool DepthTexelV(DXGI_FORMAT fmt, const uint8_t* px, double* out)
+{
+   double v = 0.0;
+   switch (fmt)
+   {
+   case DXGI_FORMAT_R24G8_TYPELESS:
+   case DXGI_FORMAT_D24_UNORM_S8_UINT:
+   case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+      v = (double)(((const uint32_t*)px)[0] & 0x00FFFFFFu) / 16777215.0; break;
+   case DXGI_FORMAT_R32_FLOAT:
+   case DXGI_FORMAT_D32_FLOAT:
+      v = (double)((const float*)px)[0]; break;
+   case DXGI_FORMAT_R16_FLOAT:
+      v = (double)HalfToFloat(((const uint16_t*)px)[0]); break;
+   case DXGI_FORMAT_R32G8X24_TYPELESS:
+   case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      v = (double)((const float*)px)[0]; break;
+   case DXGI_FORMAT_R16_UNORM:
+   case DXGI_FORMAT_R16_TYPELESS:
+   case DXGI_FORMAT_D16_UNORM:
+      v = (double)((const uint16_t*)px)[0] / 65535.0; break;
+   default: return false;
+   }
+   *out = v;
+   return true;
+}
+
+// Realfix-claude: depth value validation (one-shot cSTATS companion).
+// Samples <=4096 spread texels of a depth-ish resource: sky share (v<=1e-4,
+// expect >0 outdoors), min/max/mean. Reversed-Z reads near-0 far-skewed;
+// a LINEARIZED R32F (mean>0.5) warns -- NGX disocclusion wants the native
+// encoding, not a linearized copy. Staging mirrors WritePicRes (same-format
+// staging, proven by the depth BMP path).
+static void LogDepthValueDiag(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Resource* res, const char* name)
+{
+   char b[256];
+   if (!res) { snprintf(b, sizeof(b), "DaysGone cSTATS depth-diag %s=null", name); reshade::log::message(reshade::log::level::info, b); return; }
+   ComPtr<ID3D11Texture2D> t;
+   if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t.put()))) || !t)
+   { snprintf(b, sizeof(b), "DaysGone cSTATS depth-diag %s=n2d", name); reshade::log::message(reshade::log::level::info, b); return; }
+   D3D11_TEXTURE2D_DESC d = {};
+   t->GetDesc(&d);
+   D3D11_TEXTURE2D_DESC sd = d;
+   sd.Usage = D3D11_USAGE_STAGING;
+   sd.BindFlags = 0;
+   sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+   sd.MiscFlags = 0;
+   ComPtr<ID3D11Texture2D> st;
+   if (FAILED(dev->CreateTexture2D(&sd, nullptr, st.put())))
+   { snprintf(b, sizeof(b), "DaysGone cSTATS depth-diag %s=stag-fail fmt=%d", name, (int)d.Format); reshade::log::message(reshade::log::level::info, b); return; }
+   ctx->CopySubresourceRegion(st.get(), 0, 0, 0, 0, t.get(), 0, nullptr);
+   D3D11_MAPPED_SUBRESOURCE m = {};
+   if (FAILED(ctx->Map(st.get(), 0, D3D11_MAP_READ, 0, &m)) || !m.pData)
+   { snprintf(b, sizeof(b), "DaysGone cSTATS depth-diag %s=map-fail", name); reshade::log::message(reshade::log::level::info, b); return; }
+   uint32_t step = (uint32_t)((((uint64_t)d.Width * d.Height) / 4096) + 1);
+   double mn = 1e30, mx = -1e30, sum = 0.0;
+   uint64_t n = 0, nsky = 0;
+   for (uint32_t i = 0; i < d.Width * d.Height; i += step)
+   {
+      uint32_t x = i % d.Width, y = i / d.Width;
+      const uint8_t* px = (const uint8_t*)m.pData + (size_t)y * m.RowPitch;
+      size_t bpp = (d.Format == DXGI_FORMAT_R16_FLOAT || d.Format == DXGI_FORMAT_R16_UNORM ||
+         d.Format == DXGI_FORMAT_R16_TYPELESS || d.Format == DXGI_FORMAT_D16_UNORM) ? 2 : 4;
+      if (d.Format == DXGI_FORMAT_R32G8X24_TYPELESS || d.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) bpp = 8;
+      double v = 0.0;
+      if (!DepthTexelV(d.Format, px + (size_t)x * bpp, &v)) break;
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+      sum += v;
+      if (v <= 1e-4) nsky++;
+      n++;
+   }
+   if (n == 0)
+   { ctx->Unmap(st.get(), 0); snprintf(b, sizeof(b), "DaysGone cSTATS depth-diag %s fmt=%d unsupported", name, (int)d.Format); reshade::log::message(reshade::log::level::info, b); return; }
+   double mean = sum / (double)n;
+   // Round2: below-mean share (reversed-Z shape: far-heavy scenes pile BELOW
+   // the mean; uniform-linear sits ~50%. Read jointly with sky%/mean: high
+   // sky + high belowmean + low mean = healthy reversed-Z outdoors. No warn
+   // here -- scene-dependent (a wall-filling closeup legitimately differs).
+   uint64_t nbelow = 0;
+   for (uint32_t i = 0; i < d.Width * d.Height; i += step)
+   {
+      uint32_t x = i % d.Width, y = i / d.Width;
+      const uint8_t* px = (const uint8_t*)m.pData + (size_t)y * m.RowPitch;
+      size_t bpp = (d.Format == DXGI_FORMAT_R16_FLOAT || d.Format == DXGI_FORMAT_R16_UNORM ||
+         d.Format == DXGI_FORMAT_R16_TYPELESS || d.Format == DXGI_FORMAT_D16_UNORM) ? 2 : 4;
+      if (d.Format == DXGI_FORMAT_R32G8X24_TYPELESS || d.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) bpp = 8;
+      double v = 0.0;
+      if (!DepthTexelV(d.Format, px + (size_t)x * bpp, &v)) break;
+      if (v < mean) nbelow++;
+   }
+   ctx->Unmap(st.get(), 0);
+   bool maybe_linear = (d.Format == DXGI_FORMAT_R32_FLOAT || d.Format == DXGI_FORMAT_R16_FLOAT) && (mean > 0.5);
+   snprintf(b, sizeof(b), "DaysGone cSTATS depth-diag %s fmt=%d %ux%u sky=%.1f%% belowmean=%.1f%% mean=%.4f min=%.4f max=%.4f%s",
+      name, (int)d.Format, d.Width, d.Height, 100.0 * (double)nsky / (double)n,
+      100.0 * (double)nbelow / (double)n, mean, mn, mx, maybe_linear ? " WARN:linear-R32F?" : "");
+   reshade::log::message(reshade::log::level::info, b);
+}
+
 // M11: describe any resource as WxH:fmt (for the compute-slot logger).
 static void DescribeResHandle(ID3D11Resource* res, char* out, size_t n)
 {
@@ -1083,6 +1212,7 @@ static bool CreateViewSRV(ID3D11Device* dev, ID3D11Resource* res, ComPtr<ID3D11S
    D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
    vd.Format = vf;
    vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+   vd.Texture2D.MostDetailedMip = 0; // Realfix-claude: always mip0/base.
    vd.Texture2D.MipLevels = 1;
    return SUCCEEDED(dev->CreateShaderResourceView(res, &vd, out.put()));
 }
@@ -1784,34 +1914,46 @@ public:
                   tex->Release();
                    if (d.Width >= 400 && d.Height >= 200) // M55: was 1000x500
                    {
-                      // depthfilter: same principle as viewfilter -- only cache
-                      // depth when a gameplay-sized color RT is bound ALONGSIDE
-                      // the DSV. Depth-only (shadow/cascade) or small-RT draws
-                      // leave the last fresh cache untouched (depth capture has
-                      // no perfcap -- just skip the store).
-                      bool depthGameplay = false;
-                      {
-                         ID3D11RenderTargetView* crtv = nullptr;
-                         native_device_context->OMGetRenderTargets(1, &crtv, nullptr);
-                         if (crtv)
-                         {
-                            ID3D11Resource* cres = nullptr;
-                            crtv->GetResource(&cres);
-                            if (cres)
-                            {
-                               ID3D11Texture2D* ctex = nullptr;
-                               if (SUCCEEDED(cres->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ctex))) && ctex)
-                               {
-                                  D3D11_TEXTURE2D_DESC crd = {};
-                                  ctex->GetDesc(&crd);
-                                  depthGameplay = (crd.Width >= 400 && crd.Height >= 200);
-                                  ctex->Release();
-                               }
-                               cres->Release();
-                            }
-                            crtv->Release();
-                         }
-                      }
+                       // depthfilter: same principle as viewfilter -- only cache
+                       // depth when a gameplay-sized color RT is bound ALONGSIDE
+                       // the DSV. Depth-only (shadow/cascade) or small-RT draws
+                       // leave the last fresh cache untouched (depth capture has
+                       // no perfcap -- just skip the store).
+                       // Depthangle: ALSO require DSV~=RT size (<=4px). A
+                       // foreign DSV (shadow cascade, half-res effect target)
+                       // bound alongside a gameplay RT otherwise poisons the
+                       // cache with static-looking depth: light-space content
+                       // ignores view orbit, so the depth VIEW freezes on
+                       // exactly those angles whose draw order leaves the
+                       // foreign DSV bound last, while NGX/OwnMV smear on it.
+                       // (Session-C proof: 800x450 depth vs 1600x900 color.)
+                       // M64 1px overscan pairs still pass; anything further
+                       // apart is a different target, not scene depth.
+                       bool depthGameplay = false;
+                       {
+                          ID3D11RenderTargetView* crtv = nullptr;
+                          native_device_context->OMGetRenderTargets(1, &crtv, nullptr);
+                          if (crtv)
+                          {
+                             ID3D11Resource* cres = nullptr;
+                             crtv->GetResource(&cres);
+                             if (cres)
+                             {
+                                ID3D11Texture2D* ctex = nullptr;
+                                if (SUCCEEDED(cres->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ctex))) && ctex)
+                                {
+                                   D3D11_TEXTURE2D_DESC crd = {};
+                                   ctex->GetDesc(&crd);
+                                   uint32_t dw = d.Width > crd.Width ? d.Width - crd.Width : crd.Width - d.Width;
+                                   uint32_t dh = d.Height > crd.Height ? crd.Height - crd.Height : crd.Height - d.Height;
+                                   depthGameplay = (crd.Width >= 400 && crd.Height >= 200 && dw <= 4 && dh <= 4);
+                                   ctex->Release();
+                                }
+                                cres->Release();
+                             }
+                             crtv->Release();
+                          }
+                       }
                       if (depthGameplay)
                       {
                       auto& gd = *static_cast<DaysGoneDeviceData*>(device_data.game);
@@ -2200,6 +2342,7 @@ public:
                // t2 = scene color, t1 = depth, t0 = HUD/velocity candidate.
                LogResStats(native_device, native_device_context, rrs[2], "t2-color");
                LogResStats(native_device, native_device_context, rrs[1], "t1-depth");
+               LogDepthValueDiag(native_device, native_device_context, rrs[1], "t1-depth");
                LogResStats(native_device, native_device_context, rrs[0], "t0-hudvel");
                // The MV feed actually in use (cache or zero fallback).
                {
@@ -2324,19 +2467,69 @@ public:
                    }
                    fkb->Release();
                 }
-                auto& fgd = *static_cast<DaysGoneDeviceData*>(device_data.game);
-                uint64_t fframe = g_hist_frame.load(std::memory_order_relaxed);
-                bool ffresh = fgd.cached_mvs && fgd.cached_mvs_frame == fframe;
-                char fb[1024];
-                snprintf(fb, sizeof(fb),
-                   "DaysGone ADIAG f%d frame=%llu fidx=%llu u0=%s u1=%s t0=%s t1=%s t2=%s t3=%s cb0n=%d k01=%.5f,%.5f k22=%.5f,%.5f k26=%.5f,%.5f mv=%s hash=%08X att=%llu runs=%llu resets=%llu",
-                   fnum, (unsigned long long)fframe,
-                   (unsigned long long)cb_luma_global_settings.FrameIndex,
-                   fau0, fau1, fat[0], fat[1], fat[2], fat[3], fknf,
-                   fk0, fk1, fk22, fk23, fk26, fk27,
+                       auto& fgd = *static_cast<DaysGoneDeviceData*>(device_data.game);
+                       uint64_t fframe = g_hist_frame.load(std::memory_order_relaxed);
+                       bool ffresh = fgd.cached_mvs && fgd.cached_mvs_frame == fframe;
+                       // Realfix-claude: proj cross-check. A jittered projection
+                       // carries the shift in VP row2 (m[2][0], m[2][1]); the fed
+                       // centered jitter (FULL jit=) should equal VP[2][0]*W/2
+                       // with W = render width (t2 desc). VP comes from the
+                       // committed stash; zeros + tag when stale or t2 missing
+                       // (pair with vfp/fidx fields to judge). Caveat: if the
+                       // stashed VP is unjittered, pj stays ~0 while fk animates
+                       // -- that itself proves the CB jitter lives outside the
+                       // view matrices. Offline check: (k01-0.5)*flip vs pj.
+                       float pjx = 0.0f, pjy = 0.0f;
+                       const char* pjsrc = "nostash";
+                       if (fgd.view_frame_cur == fframe && fframe != 0)
+                       {
+                          ID3D11Resource* prot = nullptr;
+                          if (far_[2]) far_[2]->GetResource(&prot);
+                          ComPtr<ID3D11Texture2D> ptex;
+                          if (prot && SUCCEEDED(prot->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ptex))) && ptex)
+                          {
+                             D3D11_TEXTURE2D_DESC pdd = {};
+                             ptex->GetDesc(&pdd);
+                             if (pdd.Width > 0 && pdd.Height > 0)
+                             {
+                                pjx = fgd.view_cb_cur[8] * (float)pdd.Width * 0.5f;
+                                pjy = fgd.view_cb_cur[9] * (float)pdd.Height * 0.5f;
+                                pjsrc = "stash";
+                             }
+                             else pjsrc = "nowsize";
+                          }
+                           else pjsrc = "not2";
+                           if (prot) prot->Release();
+                        }
+                        // Round2: per-frame residual (ONE line proves/disproves:
+                        // centered-CB px minus proj-side px, same flip convention
+                        // as the feed. ~0 while panning = CB jitter IS the
+                        // reprojection jitter; constant offset = bias left;
+                        // wild = wrong indices entirely).
+                        float pjfx = g_jit_flip_x.load(std::memory_order_relaxed) ? 1.0f : -1.0f;
+                        float pjfy = g_jit_flip_y.load(std::memory_order_relaxed) ? 1.0f : -1.0f;
+                        float pjresx = (fk0 - 0.5f) * pjfx - pjx;
+                        float pjresy = (fk1 - 0.5f) * pjfy - pjy;
+                        // Round2: cache identity per frame (steady-orbit changes
+                        // visible: same handle+frame = refreshing; frozen frame
+                        // = nothing qualifying pooled (see depthfilter skips);
+                        // changed handle at same size = pool rotation).
+                        char fdc[64] = {};
+                        DescribeResHandle(fgd.cached_depth.get(), fdc, sizeof(fdc));
+                        uint64_t fdcframe = fgd.cached_depth_frame;
+                        char fb[1024];
+                  snprintf(fb, sizeof(fb),
+                     "DaysGone ADIAG f%d frame=%llu fidx=%llu u0=%s u1=%s t0=%s t1=%s t2=%s t3=%s cb0n=%d k01=%.6f,%.6f k22=%.5f,%.5f k26=%.5f,%.5f pj=%.3f,%.3f(%s) pjres=%.3f,%.3f mv=%s hash=%08X att=%llu runs=%llu resets=%llu drej=%d dcache=%s@%llu hybr=%llu",
+                     fnum, (unsigned long long)fframe,
+                     (unsigned long long)cb_luma_global_settings.FrameIndex,
+                     fau0, fau1, fat[0], fat[1], fat[2], fat[3], fknf,
+                     fk0, fk1, fk22, fk23, fk26, fk27, pjx, pjy, pjsrc, pjresx, pjresy,
                    ffresh ? "real" : "ZERO", (unsigned)fgd.cached_mvs_hash,
-                   (unsigned long long)g_cdlss_attempts.load(),
-                   (unsigned long long)g_cdlss_runs.load(), (unsigned long long)g_cdlss_resets.load());
+                     (unsigned long long)g_cdlss_attempts.load(),
+                     (unsigned long long)g_cdlss_runs.load(), (unsigned long long)g_cdlss_resets.load(),
+                     g_clast_dreason.load(std::memory_order_relaxed),
+                     fdc, (unsigned long long)fdcframe,
+                     (unsigned long long)g_hybdim_mismatch.load(std::memory_order_relaxed));
                 reshade::log::message(reshade::log::level::info, fb);
                 for (int i = 0; i < 2; i++) if (fau[i]) fau[i]->Release();
                 for (int i = 0; i < 4; i++) if (far_[i]) far_[i]->Release();
@@ -2493,39 +2686,160 @@ public:
                    // M58: depth-source resolve. Cached DSV is guaranteed depth
                    // (bound as depth-stencil at a fullscreen draw this frame);
                    // slot t1 is only depth if it actually carries depth.
-                   const char* c_depth_src = "slot-t1";
-                   {
-                      int dmode = g_cdepth_src.load(std::memory_order_relaxed);
-                      auto& gdd = *static_cast<DaysGoneDeviceData*>(device_data.game);
-                       bool cache_fresh = gdd.cached_depth &&
-                          gdd.cached_depth_frame == g_hist_frame.load(std::memory_order_relaxed);
-                       { // templog: depth age in frames (log-only, 0 = fresh).
-                          uint64_t hfr = g_hist_frame.load(std::memory_order_relaxed);
-                          g_clast_dage.store(!gdd.cached_depth ? 9999ULL : (cache_fresh ? 0ULL : (gdd.cached_depth_frame <= hfr ? hfr - gdd.cached_depth_frame : 0ULL)), std::memory_order_relaxed);
+                    const char* c_depth_src = "slot-t1";
+                    {
+                       int dmode = g_cdepth_src.load(std::memory_order_relaxed);
+                       auto& gdd = *static_cast<DaysGoneDeviceData*>(device_data.game);
+                        bool cache_fresh = gdd.cached_depth &&
+                           gdd.cached_depth_frame == g_hist_frame.load(std::memory_order_relaxed);
+                        { // templog: depth age in frames (log-only, 0 = fresh).
+                           uint64_t hfr = g_hist_frame.load(std::memory_order_relaxed);
+                           g_clast_dage.store(!gdd.cached_depth ? 9999ULL : (cache_fresh ? 0ULL : (gdd.cached_depth_frame <= hfr ? hfr - gdd.cached_depth_frame : 0ULL)), std::memory_order_relaxed);
+                        }
+                       // Realfix: slot-t1 format probe (M58 poison guard).
+                       // Accumulation/history buffers arrive as color formats
+                       // (fmt10 RGBA16F etc); real depth arrives depth-derived.
+                       // Allowlist only -- unknown formats never feed as depth.
+                       uint32_t t1w = 0, t1h = 0;
+                       bool t1_is_depth = false;
+                       // NOTE (mip pitfall): QueryInterface+GetDesc reads the
+                       // TEXTURE desc (base resource, full dims) -- never an
+                       // SRV mip subview -- so t1w/t1h are always base dims.
+                       // All SRVs we create pin MostDetailedMip=0 the same way.
+                       if (csrvs[1])
+                       {
+                          ComPtr<ID3D11Texture2D> t1t;
+                          if (SUCCEEDED(csrvs[1]->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(t1t.put()))))
+                          {
+                             D3D11_TEXTURE2D_DESC t1d = {};
+                             t1t->GetDesc(&t1d);
+                             t1w = t1d.Width; t1h = t1d.Height;
+                             switch (t1d.Format)
+                             {
+                             case DXGI_FORMAT_D32_FLOAT:             // 40
+                             case DXGI_FORMAT_R32_FLOAT:             // 41
+                             case DXGI_FORMAT_R24G8_TYPELESS:        // 42
+                             case DXGI_FORMAT_D24_UNORM_S8_UINT:     // 45
+                             case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: // 47
+                             case DXGI_FORMAT_R32G8X24_TYPELESS:     // 49
+                             case DXGI_FORMAT_R16_FLOAT:             // 54
+                             case DXGI_FORMAT_D16_UNORM:             // 55
+                                t1_is_depth = true; break;
+                             default: break; // color/accum/history: never depth
+                             }
+                          }
                        }
-                      if ((dmode == 0 && cache_fresh) || dmode == 2)
-                      {
-                         if (gdd.cached_depth && (dmode == 2 || cache_fresh))
-                         {
-                            c_depth.reset();
-                            c_depth = gdd.cached_depth;
-                            c_depth_src = "cache-DSV";
-                            // Resfix: depth-size vs live render check (NGX +
-                            // OwnMV assume depth == render). Fed anyway (M58:
-                            // slot-t1 fallback is worse), but warned once per
-                            // resize so a mismatch is diagnosable, not silent.
-                            if ((gdd.cached_depth_w != crw || gdd.cached_depth_h != crh) &&
-                                !gdd.logged_cdepth_dims)
-                            {
-                               gdd.logged_cdepth_dims = true;
-                               char dwarn[192];
-                               snprintf(dwarn, sizeof(dwarn), "DaysGone cDLSS depth-dims %ux%u vs render %ux%u (cache-DSV fed anyway)",
-                                  gdd.cached_depth_w, gdd.cached_depth_h, crw, crh);
-                               reshade::log::message(reshade::log::level::warning, dwarn);
-                            }
-                         }
-                      }
-                   }
+                       bool cache_match = cache_fresh && gdd.cached_depth_w == crw && gdd.cached_depth_h == crh;
+                       bool t1_match = t1_is_depth && t1w == crw && t1h == crh;
+                       // Round2 (strict): feed ⟺ dims-match. dmode2 = cache iff
+                       // fresh+match; dmode1 = slot-t1 iff plausible+match;
+                       // Auto = first dims-match wins (cache, then t1).
+                       // Anything else resets -> capture-fail/native path.
+                       // Rationale: NGX + OwnMV assume depth == render; a
+                       // mismatched feed smears every frame it runs, while
+                       // native is always correct. ddim!=render on a FED frame
+                       // is now a selection bug (tripwire below).
+                       if (dmode == 2)
+                       {
+                          if (cache_match)
+                          {
+                             c_depth.reset();
+                             c_depth = gdd.cached_depth;
+                             c_depth_src = "cache-DSV";
+                          }
+                          else
+                          {
+                             c_depth.reset();
+                          }
+                       }
+                       else if (dmode == 1)
+                       {
+                          if (!(t1_is_depth && t1_match))
+                             c_depth.reset(); // slot-t1 accum/wrong-size refused
+                       }
+                       else // Auto: dims-matching depth wins
+                       {
+                          if (cache_match)
+                          {
+                             c_depth.reset();
+                             c_depth = gdd.cached_depth;
+                             c_depth_src = "cache-DSV";
+                          }
+                          else if (t1_is_depth && t1_match)
+                          {
+                             c_depth_src = "slot-t1"; // (already bound above)
+                          }
+                          else
+                          {
+                             c_depth.reset();
+                          }
+                       }
+                       // Resfix warn (kept): any cache/render mismatch is
+                       // diagnosable, not silent. Re-armed on every resize.
+                       if (cache_fresh && (gdd.cached_depth_w != crw || gdd.cached_depth_h != crh) &&
+                           !gdd.logged_cdepth_dims)
+                       {
+                          gdd.logged_cdepth_dims = true;
+                          char dwarn[192];
+                          snprintf(dwarn, sizeof(dwarn), "DaysGone cDLSS depth-dims %ux%u vs render %ux%u (mismatched cache refused; ddim=/capture FAIL show what fed)",
+                             gdd.cached_depth_w, gdd.cached_depth_h, crw, crh);
+                          reshade::log::message(reshade::log::level::warning, dwarn);
+#if TEST || DEVELOPMENT
+                          AppendFullLogLine(g_marker_module, dwarn); // Realfix-claude: warn dup
+#endif
+                       }
+                       // Round2: refusal reason for ADIAG (0=cache-fed, 1=t1-fed,
+                       // 2=cache-stale, 3=cache-size, 4=t1-format, 5=t1-size,
+                       // 6=none-native). Frequent 6 in normal orbit = over-strict
+                       // filter (watch this before tightening further).
+                       {
+                          int drej = 6;
+                          if (c_depth)
+                             drej = (c_depth.get() == gdd.cached_depth.get()) ? 0 : 1;
+                          else if (gdd.cached_depth && !cache_fresh)
+                             drej = 2;
+                          else if (gdd.cached_depth)
+                             drej = 3;
+                          else if (t1w || t1h)
+                             drej = t1_is_depth ? 5 : 4;
+                          g_clast_dreason.store(drej, std::memory_order_relaxed);
+                       }
+                       { // Round2: fed-depth dims straight from the resource
+                          // (proves base-mip full-res; GetDesc reads the TEXTURE,
+                          // never an SRV mip subview). ddim!=render on a FED frame
+                          // is now a selection bug -- tripwire below. t1w/t1h
+                          // above stay for the matching decision itself.
+                          uint32_t ddw = 0, ddh = 0;
+                          if (c_depth)
+                          {
+                             ComPtr<ID3D11Texture2D> ddt;
+                             if (SUCCEEDED(c_depth->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ddt))) && ddt)
+                             {
+                                D3D11_TEXTURE2D_DESC ddd = {};
+                                ddt->GetDesc(&ddd);
+                                ddw = ddd.Width; ddh = ddd.Height;
+                                if (ddd.MipLevels != 1 && !gdd.logged_cdepth_dims)
+                                {
+                                   gdd.logged_cdepth_dims = true;
+                                   char dmwarn[192];
+                                   snprintf(dmwarn, sizeof(dmwarn), "DaysGone cDLSS depth %ux%u has %u mips (base-mip assumed)",
+                                      ddw, ddh, (unsigned)ddd.MipLevels);
+                                   reshade::log::message(reshade::log::level::warning, dmwarn);
+                                }
+                                else if ((ddw != crw || ddh != crh) && !gdd.logged_cdepth_dims)
+                                {
+                                   gdd.logged_cdepth_dims = true;
+                                   char diwarn[192];
+                                   snprintf(diwarn, sizeof(diwarn), "DaysGone cDLSS INVARIANT BROKEN: fed depth %ux%u vs render %ux%u",
+                                      ddw, ddh, crw, crh);
+                                   reshade::log::message(reshade::log::level::warning, diwarn);
+                                }
+                             }
+                          }
+                          g_clast_ddw.store(ddw, std::memory_order_relaxed);
+                          g_clast_ddh.store(ddh, std::memory_order_relaxed);
+                       }
+                    }
                   if (uavs[0])
                   {
                      ID3D11Resource* tmp = nullptr;
@@ -2719,11 +3033,16 @@ public:
                                    // M51: full modes sample game depth (R24 view).
                                    // Without it they fall back to game MVs.
                                    ComPtr<ID3D11ShaderResourceView> owndepth;
-                                   if (own_full && gd.cached_depth)
+                                   // Depthangle: own-Full needs FRESH depth like
+                                   // M11 (stale cache + live color = smear, not
+                                   // just a stale view).
+                                   if (own_full && gd.cached_depth &&
+                                       gd.cached_depth_frame == g_hist_frame.load(std::memory_order_relaxed))
                                    {
                                       D3D11_SHADER_RESOURCE_VIEW_DESC dvd = {};
                                       dvd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
                                       dvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                                      dvd.Texture2D.MostDetailedMip = 0; // Realfix-claude: mip0/base.
                                       dvd.Texture2D.MipLevels = 1;
                                       if (FAILED(native_device->CreateShaderResourceView(gd.cached_depth.get(), &dvd, owndepth.put())))
                                          owndepth.reset();
@@ -2755,6 +3074,14 @@ public:
                                          ofc[49] = (float)((double)vcur_c[173] - (double)vprv_c[173]);
                                          ofc[50] = (float)((double)vcur_c[174] - (double)vprv_c[174]);
                                          ofc[51] = 0.0f;
+                                         // Realfix-claude: per-frame T-row identity
+                                         // for FULL th/tph (pairs with the fed
+                                         // pair; vfp stamps judge pairing).
+                                         g_clast_th.store(Fnv1aBytes(vcur_c + 172, 16), std::memory_order_relaxed);
+                                         g_clast_tph.store(Fnv1aBytes(vprv_c + 172, 16), std::memory_order_relaxed);
+                                         // Round2: R-block checksums (same fed pair).
+                                         g_clast_rck.store(ViewPickCksum(vcur_c), std::memory_order_relaxed);
+                                         g_clast_rpck.store(ViewPickCksum(vprv_c), std::memory_order_relaxed);
                                         native_device_context->Unmap(godc.cb_ownmv.get(), 0);
                                         DrawStateStack<DrawStateStackType::FullGraphics> own_cs_c;
                                         own_cs_c.Cache(native_device_context, device_data.uav_max_count);
@@ -2915,9 +3242,22 @@ public:
                        // (no second target, no feed restructuring). Toggle OFF
                        // or missing input: falls through untouched (game conv
                        // OR own OR zero fallback, codes unchanged).
-                       if (g_hybrid_mv.load(std::memory_order_relaxed) && own_done_c && mv_sel && gd.srv_mvs_conv)
-                       {
-                          if (!gd.tex_mvs_hybrid || gd.mvs_hybrid_w != crw || gd.mvs_hybrid_h != crh)
+                        if (g_hybrid_mv.load(std::memory_order_relaxed) && own_done_c && mv_sel && gd.srv_mvs_conv)
+                        {
+                           // Round2: ratio-1 debug counter (must read 0 when
+                           // game/own dims match; any nonzero = the guv mapping
+                           // above is actually rescaling live data).
+                           {
+                              ComPtr<ID3D11Texture2D> hmt;
+                              if (mv_sel && SUCCEEDED(mv_sel->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&hmt))) && hmt)
+                              {
+                                 D3D11_TEXTURE2D_DESC hmd = {};
+                                 hmt->GetDesc(&hmd);
+                                 if (hmd.Width != crw || hmd.Height != crh)
+                                    g_hybdim_mismatch.fetch_add(1, std::memory_order_relaxed);
+                              }
+                           }
+                           if (!gd.tex_mvs_hybrid || gd.mvs_hybrid_w != crw || gd.mvs_hybrid_h != crh)
                           {
                              gd.srv_mvs_hybrid.reset();
                              gd.rtv_mvs_hybrid.reset();
@@ -2987,7 +3327,49 @@ public:
                              }
                           }
                        }
-                      // M36: feed census (inputs were good -- this frame reaches NGX).
+                       // Realfix-claude: MV dims guard. Convert/hybrid assume the
+                       // game buffer is render-sized; on mismatch prefer own
+                       // (render-sized by construction), else go native this
+                       // frame (force_reset + early-out like capture-fail).
+                       // Never silently half-feed. One-shot warn per distinct
+                       // mismatch size (resets when matched again).
+                       {
+                          uint32_t mvw = 0, mvh = 0;
+                          if (c_mv_res)
+                          {
+                             ComPtr<ID3D11Texture2D> mvt;
+                             if (SUCCEEDED(c_mv_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&mvt))) && mvt)
+                             {
+                                D3D11_TEXTURE2D_DESC mvd = {};
+                                mvt->GetDesc(&mvd);
+                                mvw = mvd.Width; mvh = mvd.Height;
+                             }
+                          }
+                          if (c_mv_real && c_mv_res && (mvw != crw || mvh != crh))
+                          {
+                             static uint32_t last_mvw = 0, last_mvh = 0;
+                             if (mvw != last_mvw || mvh != last_mvh)
+                             {
+                                last_mvw = mvw; last_mvh = mvh;
+                                char mwarn[192];
+                                snprintf(mwarn, sizeof(mwarn), "DaysGone cDLSS MV-dims %ux%u vs render %ux%u (%s)",
+                                   mvw, mvh, crw, crh, (own_done_c && gd.tex_mvs_conv) ? "own fallback" : "native fallback");
+                                reshade::log::message(reshade::log::level::warning, mwarn);
+                             }
+                             if (own_done_c && gd.tex_mvs_conv)
+                             {
+                                c_mv_res = gd.tex_mvs_conv.get();
+                                c_mv_src = "own-fallback";
+                                c_mv_code = 4;
+                             }
+                          else
+                          {
+                             device_data.force_reset_sr = true;
+                             return DrawOrDispatchOverrideType::None; // native TAA runs
+                          }
+                       }
+                       } // Realfix-claude: end MV dims guard (outer block)
+                       // M36: feed census (inputs were good -- this frame reaches NGX).
                       if (!c_mv_real) c_mv_code = 0;
                       if (c_mv_real)
                          g_cmv_frames_real.fetch_add(1, std::memory_order_relaxed);
@@ -3013,6 +3395,9 @@ public:
                             gd.view_pick_run = 0;
                             gd.view_reanchor_run = 0;
                             gd.logged_cdepth_dims = false;
+                            // Depthangle: new mode = new depth. A same-size
+                            // stale cache from another scene must not feed.
+                            gd.cached_depth_frame = 0;
                             char rb[128];
                             snprintf(rb, sizeof(rb), "DaysGone cDLSS resize %ux%u -> %ux%u (render %ux%u): forcing NGX reset",
                                pcw, pch, cow, coh, crw, crh);
@@ -3127,8 +3512,18 @@ public:
                                        g_jit_rawx.store(f[0]);
                                        g_jit_rawy.store(f[1]);
                                        // (Deep1: FULLAGG jitter accumulators retired.)
-                                       cjit_x = f[0];
-                                       cjit_y = f[1];
+                                       // Realfix: CB0[0]/[1] arrive always-positive
+                                       // [0,1]-ish (3000+ FULL lines: fed jit
+                                       // never crosses zero per axis). Center
+                                       // to [-0.5,+0.5]px (Halton-style jitter
+                                       // is zero-mean; the raw +0.5 bias reads
+                                       // as constant ~1px motion = shake).
+                                       // Flips + 1.0 scale + cjit gate below
+                                       // unchanged. FULL logs centered (jit=)
+                                       // beside raw (jitraw jd00/jd01), so the
+                                       // next trace proves zero-crossing.
+                                       cjit_x = f[0] - 0.5f;
+                                       cjit_y = f[1] - 0.5f;
                                        if (cjit_x > 32.0f || cjit_x < -32.0f || cjit_y > 32.0f || cjit_y < -32.0f)
                                        {
                                           cjit_x = 0.0f; cjit_y = 0.0f;
@@ -3141,6 +3536,41 @@ public:
                                        g_jitdbg_27.store(f[27]);
                                        g_jitdbg_cjit.store(cjit_x);
                                        g_jitdbg_cjit_y.store(cjit_y);
+                                       // Round2: pj-fallback. If CB raw stays
+                                       // bitwise-identical 16 frames running while
+                                       // the stash VP animates, the CB slot is NOT
+                                       // jitter (constant bias?) -- feed the
+                                       // proj-side pixels instead. CB path stays
+                                       // default (every captured mode animates raw,
+                                       // so this never fires there). Proj math is
+                                       // top-left-positive already (OwnMV
+                                       // convention): no CB flips applied here.
+                                       {
+                                          static float last_r0 = 0.0f, last_r1 = 0.0f;
+                                          static float last_pjx = 0.0f, last_pjy = 0.0f;
+                                          static int raw_stable_n = 0;
+                                          static bool pj_moved = false;
+                                          uint64_t jframe = g_hist_frame.load(std::memory_order_relaxed);
+                                          float pjx = 0.0f, pjy = 0.0f;
+                                          bool pjok = (gd.view_frame_cur == jframe && jframe != 0 && crw > 0 && crh > 0);
+                                          if (pjok)
+                                          {
+                                             pjx = gd.view_cb_cur[8] * (float)crw * 0.5f;
+                                             pjy = gd.view_cb_cur[9] * (float)crh * 0.5f;
+                                             if (pjx != last_pjx || pjy != last_pjy) pj_moved = true;
+                                             last_pjx = pjx; last_pjy = pjy;
+                                          }
+                                          if (f[0] == last_r0 && f[1] == last_r1) raw_stable_n++;
+                                          else { raw_stable_n = 0; pj_moved = false; }
+                                          last_r0 = f[0]; last_r1 = f[1];
+                                          if (raw_stable_n >= 16 && pj_moved && pjok)
+                                          {
+                                             cjit_x = pjx;
+                                             cjit_y = pjy;
+                                             g_clast_jsrc.store(1, std::memory_order_relaxed);
+                                          }
+                                          else g_clast_jsrc.store(0, std::memory_order_relaxed);
+                                       }
                                        native_device_context->Unmap(gd.staging_cb.get(), 0);
                                     }
                                  }
@@ -3150,6 +3580,15 @@ public:
                         }
                         cdraw_data.jitter_x = 0.0f;
                         cdraw_data.jitter_y = 0.0f;
+                        // Realfix-claude verification protocol (offline, from FULL):
+                        // collect 16+ frames of jitraw jd00/jd01 (%.6f, never
+                        // truncated): a real Halton-style source shows 8-16
+                        // DISTINCT fractional values with mean ~= 0.5. Fewer
+                        // distinct values = stepped/quantized CB (still usable);
+                        // mean far from 0.5 or constant = not jitter (wrong CB
+                        // indices -- the [26]/[27] 1px-constant lesson). Then
+                        // cross-check (fk-0.5)*flip against ADIAG pj (proj-side
+                        // px); mismatch direction => sign-test flips.
                         if (g_cjitter_on.load(std::memory_order_relaxed))
                         {
                            float cjs = GetJitScale();
@@ -3221,6 +3660,11 @@ public:
                               (int)g_c_srgb_output.load(std::memory_order_relaxed), c_depth_src,
                               cdraw_data.jitter_x, cdraw_data.jitter_y);
                            reshade::log::message(reshade::log::level::info, b);
+#if TEST || DEVELOPMENT
+                           // Realfix-claude: first-Draw also lands in full.log
+                           // (ReShade.log kept coming back 0 bytes).
+                           AppendFullLogLine(g_marker_module, b);
+#endif
                         }
                         // M63: Draw failures after the first were silent (native
                         // runs instead, looks like "DLSS does nothing"). Log the
@@ -5060,6 +5504,7 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    int rst = g_clast_reset.load(std::memory_order_relaxed);
    float jx = g_clast_jitx.load(std::memory_order_relaxed);
    float jy = g_clast_jity.load(std::memory_order_relaxed);
+   const char* jsrcs = g_clast_jsrc.load(std::memory_order_relaxed) ? "pj" : "cb";
    float jd00 = g_jitdbg_00.load(std::memory_order_relaxed);
    float jd01 = g_jitdbg_01.load(std::memory_order_relaxed);
    float jd26 = g_jitdbg_26.load(std::memory_order_relaxed);
@@ -5098,6 +5543,28 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    if (!firstfi && fi != last_fi + 1) fibang = '!';
    firstfi = false; last_fi = fi;
    uint64_t dage = g_clast_dage.load(std::memory_order_relaxed);
+   uint32_t ddw = g_clast_ddw.load(std::memory_order_relaxed);
+   uint32_t ddh = g_clast_ddh.load(std::memory_order_relaxed);
+   uint32_t th = g_clast_th.load(std::memory_order_relaxed);
+   uint32_t tph = g_clast_tph.load(std::memory_order_relaxed);
+   uint32_t rck = g_clast_rck.load(std::memory_order_relaxed);
+   uint32_t rpck = g_clast_rpck.load(std::memory_order_relaxed);
+   // Round2: main-view check (rules out secondary-view pool picks). The
+   // committed projection must satisfy p00/p11 == 1/aspect with the LIVE
+   // render dims: zoom preserves the ratio, a foreign view breaks it.
+   int mainview = 0;
+   {
+      int lrw = g_clast_rw.load(std::memory_order_relaxed);
+      int lrh = g_clast_rh.load(std::memory_order_relaxed);
+      if (vp00 > 0.0f && vp11 > 0.0f && lrw > 0 && lrh > 0)
+      {
+         float ratio = vp00 / vp11, expect = (float)lrh / (float)lrw, dr = ratio - expect;
+         if (dr < 0) dr = -dr;
+         mainview = (dr <= 0.03f) ? 1 : 0;
+      }
+   }
+   uint32_t ddw = g_clast_ddw.load(std::memory_order_relaxed);
+   uint32_t ddh = g_clast_ddh.load(std::memory_order_relaxed);
    uint64_t dskip = g_depth_cache_skips.load(std::memory_order_relaxed);
    uint64_t ccv = g_color_changes.load(std::memory_order_relaxed);
    int cvsrc = g_cview_stash_src.load(std::memory_order_relaxed);
@@ -5116,6 +5583,21 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    }
    for (char* p = cvreason; *p; ++p) { if (*p == ' ' || *p == ':') *p = '_'; }
    int fmaster = g_freeze_master.load(std::memory_order_relaxed) ? 1 : 0;
+   // Realfix-claude: running mean of raw CB jitter (jd00/jd01) over the
+   // current trace run. A real Halton-style source converges ~= 0.5 on both
+   // axes; a stuck/constant source sits anywhere. Reset on run-arm detect
+   // (frames_left jumps up), same pattern as the file batcher.
+   static double s_jmx = 0.0, s_jmy = 0.0;
+   static uint64_t s_jn = 0;
+   static int s_jlast = 0;
+   {
+      int jleft = g_fulltrace_frames_left.load(std::memory_order_relaxed);
+      if (jleft > s_jlast) { s_jmx = 0.0; s_jmy = 0.0; s_jn = 0; }
+      s_jlast = jleft;
+      s_jmx += (double)jd00; s_jmy += (double)jd01; s_jn++;
+   }
+   double jmeanx = s_jn ? s_jmx / (double)s_jn : 0.0;
+   double jmeany = s_jn ? s_jmy / (double)s_jn : 0.0;
    // real vs zero vs stale: stale = last MV was real but the compute slot has
    // been silent 30+ presents (feed not refreshed; same 30f rule as M53/feed).
    const char* mvst = mvreal ? "real" : "zero";
@@ -5141,14 +5623,15 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    // margin. snprintf stays truncation-safe regardless -- never fail-fast.
    char line[2048] = {};
    snprintf(line, sizeof(line),
-      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jitraw=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu dskip=%llu cc=%llu",
+      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jsrc=%s jitraw=%.6f,%.6f,%.2f,%.2f,%.2f,%.2f jmean=%.3f,%.3f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu dskip=%llu cc=%llu ddim=%ux%u th=%08X tph=%08X rck=%08X rpck=%08X mainview=%d",
       (unsigned long long)present, DG_BUILD_ID,
       (unsigned long long)draws, (unsigned long long)frozen,
       (unsigned long long)att, (unsigned long long)runs, (unsigned long long)resets,
-      mvst, (unsigned)mvhash, mvfmt, mvsrc, mvcode, owng, vfc, vfp2, vfo, ok ? 1 : 0, rst ? 1 : 0, jx, jy, jd00, jd01, jd26, jd27, jdcx, jdcy, cvst, fmaster,
+      mvst, (unsigned)mvhash, mvfmt, mvsrc, mvcode, owng, vfc, vfp2, vfo, ok ? 1 : 0, rst ? 1 : 0, jx, jy, jsrcs, jd00, jd01, jd26, jd27, jdcx, jdcy, jmeanx, jmeany, cvst, fmaster,
       vpick, vnpool, preads, pskip, (unsigned)pickck, (unsigned long long)drej, (unsigned long long)dproj, vp00, vp11, rotmag,
       cown, cmsc, cmvsjit, cdec, cfx, cfy, csc, con, fovsl, fovtrue, (unsigned long long)fi, fibang,
-      (unsigned long long)dage, (unsigned long long)dskip, (unsigned long long)ccv);
+      (unsigned long long)dage, (unsigned long long)dskip, (unsigned long long)ccv, ddw, ddh, (unsigned)th, (unsigned)tph,
+      (unsigned)rck, (unsigned)rpck, mainview);
 #if TEST || DEVELOPMENT
    AppendFullLogLine(hModule, line);
 #else
@@ -5157,9 +5640,28 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    {
       // Trace1200: mirror sized for the grown line[] (14 + 2047); snprintf
       // truncates safely if a freak session ever exceeds it (mirror only).
-      char rline[2112] = {};
+      char rline[2144] = {};
       snprintf(rline, sizeof(rline), "DaysGone FULL %s", line);
       reshade::log::message(reshade::log::level::info, rline);
+   }
+   // Realfix-claude: HOLD-STALL hook (rotation-shake faker: a frozen pair
+   // fused under real motion reads exactly like rotation shake). The rejD/
+   // projrejD deltas already expose holds per frame; this adds one grep line
+   // per hold ENTRY (transition-gated, not per frame). Assert TPrev/TCur
+   // offline: tph(n) must equal th(n-1) bitwise across FED frames (vfp/fidx).
+   {
+      static int last_holdg = -1;
+      if ((owng == 1 || owng == 2) && last_holdg != owng)
+      {
+         char hwarn[160];
+         snprintf(hwarn, sizeof(hwarn), "DaysGone OWN HOLD-STALL owng=%d vfp=%llu/%llu (stale pair under motion?)", owng,
+            vfc, vfp2);
+         reshade::log::message(reshade::log::level::info, hwarn);
+#if TEST || DEVELOPMENT
+         AppendFullLogLine(hModule, hwarn);
+#endif
+      }
+      last_holdg = owng;
    }
    // Deep1: FULLAGG window aggregate deleted (accumulators retired above;
    // single FULL 300-frame + AUDIT + cSTATS cover diagnosis).

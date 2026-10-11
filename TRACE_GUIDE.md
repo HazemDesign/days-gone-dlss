@@ -35,6 +35,27 @@ buffers); this note is the procedure around it.
 - The 10 `DaysGone AUDIT` lines (move + pan while they log), or the
   `DaysGone FULL` lines covering a slow 5s pan.
 - `first-Draw cDLSS` line, `mvhash=`/`dec=` values, N used.
+- Jitter proof pack: 16+ FULL `jit=` values (must cross zero on both axes
+  now that the feed is centered; raw `jitraw` jd00/jd01 at %.6f must show
+  8-16 distinct fractions with `jmean=` ~= 0.5,0.5 over the run — fewer
+  distinct = stepped CB, mean far from 0.5 = wrong CB indices), plus one
+  ADIAG run (`pj=` proj-side px vs `(k01-0.5)*flip` — equal magnitude =
+  identity proven, else direction gives the flip; per-frame `pjres=` settles
+  it in ONE line). If raw takes only {0,1} while `pj` animates, the build
+  feeds `pj` automatically (`jsrc=pj` in FULL, else `cb`).
+- Dims proof pack: FULL `ddim=` MUST equal render dims on every fed frame
+  (0/0 = no depth fed = native fallback, by design); AUDIT `mvres=` MUST
+  equal render (a mismatch now warns + falls back instead of half-feeding).
+- T-row proof pack: FULL `th=`/`tph=` — assert `tph(n)==th(n-1)` bitwise
+  across fed frames (vfp/fidx stamps); `rck=`/`rpck=` rotation checksums do
+  the same for the jitter-free R rows; `mainview=1` required (0 = secondary
+  view pooled — distrust that stretch). Any `OWN HOLD-STALL` line marks a
+  frozen pair under motion (rotation-shake faker).
+- Sign test (static camera): with centered jitter ON, nudge the camera a
+  known 1px-equivalent (or compare consecutive Halton steps): native image
+  shift must match the fed centered delta direction. If motion ghosts
+  BACKWARDS, flip jitter X/Y (Legacy header) and re-run — one axis at a
+  time, then both.
 - Before sharing any bundle: run
   `pwsh -ExecutionPolicy Bypass -File scripts\collect-bundle.ps1`,
   which redacts your user profile (`~`) and absolute game path

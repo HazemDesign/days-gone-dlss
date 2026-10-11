@@ -46,6 +46,11 @@ float2 main(float4 pos : SV_Position) : SV_Target0
     {
         float3 vpos = dView * (Near / d);
 #if FULLMODE == 1
+        // Diag-only (audit verdict: Full-B wins): float172 rows are camera
+        // POSITIONS C, not V-row translation t, so Cc/Cp/TPrev here mismatch
+        // their V-row semantics (off by ~|C|). Kept for A/B only; Full-B is
+        // the live path. Do NOT "fix" Full-A by guessing -- it needs
+        // slot-content proof, and the B≫A live verdict already settled it.
         float3 Cc = -(RVT_Mul(TCur.xyz, RCurr));
         float3 Cp = -(RVT_Mul(TPrev.xyz, RPrev));
         dWorld = RVT_Mul(vpos, RCurr) + Cc;

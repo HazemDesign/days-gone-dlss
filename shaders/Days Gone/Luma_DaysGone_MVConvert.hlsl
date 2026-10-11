@@ -30,6 +30,14 @@
 //       single-axis flips were never tested; upstream bakes -delta*(0.5,-0.5))
  //   8 = X-negated upstream + raw-written snap (M37: mirrors the upstream
 //       convention — theory favorite; if motion locks here, sign was it)
+// Sampling note (realfix): 1:1 min-clamp below stays ON PURPOSE. This is a
+// single-texture pass (t0 only) with no render-dims uniform, so proportional
+// pos/out*in mapping is unimplementable here without new bindings -- and
+// every capture ever taken shows velocity == render size (AUDIT mvres=WxH,
+// full-size vel BMPs), i.e. 1:1 is already exact. The Hybrid twin (which
+// owns both GetDimensions) carries the proportional mapping instead. If a
+// mismatched-velocity capture ever appears, bind render dims and mirror the
+// Hybrid guv pattern here (3 lines, identity when matched).
 Texture2D<float2> MVInputTex : register(t0);
 
 float2 main(float4 pos : SV_Position) : SV_Target0
