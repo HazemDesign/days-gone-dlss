@@ -34,7 +34,7 @@
 #define DG_HOTKEY_DLSS VK_F9
 #define DG_HOTKEY_TRACE VK_F10
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid-menuclean-mvraw-tracefix-cleanup-resfix-deep1-m7stub-trace1200-fov688-realfix-claudefix-depthangle-claude2-m7viewretire-dhfix-drejcount";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid-menuclean-mvraw-tracefix-cleanup-resfix-deep1-m7stub-trace1200-fov688-realfix-claudefix-depthangle-claude2-m7viewretire-dhfix-drejcount-drejdim-clobber";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -140,9 +140,12 @@ struct DaysGoneDeviceData : public GameDeviceData
    // the HDR post family does (full-res R24G8 DSV). Latest seen wins.
    ComPtr<ID3D11Resource> cached_depth;
    uint64_t cached_depth_frame = 0;
-   // Resfix: depth-dims at cache time (warn when cache-DSV size != live
-   // render size at the M11 slot; NGX + OwnMV assume depth == render).
-   uint32_t cached_depth_w = 0, cached_depth_h = 0;
+    // Resfix: depth-dims at cache time (warn when cache-DSV size != live
+    // render size at the M11 slot; NGX + OwnMV assume depth == render).
+    uint32_t cached_depth_w = 0, cached_depth_h = 0;
+    // clobber: paired RT dims + DSV format at cache time (refused-pair forensics).
+    uint32_t cached_rt_w = 0, cached_rt_h = 0;
+    int cached_depth_fmt = 0;
    // M8: per-frame velocity cache. Producers: 1E94CABC/5846E9DA/6C6AD505/
    // A1A256FA/A5CB30BF/BE0130E5 render the persistent 1920x1080 RG buffer
    // (fmt35 = R16G16_UNORM per UE convention); depth/motion CS consume it.
@@ -375,6 +378,19 @@ static std::atomic<int> g_clast_dreason{ -1 };
 // gameplay). Incremented once per compute-slot fire next to the reason store;
 // log-only, never read by feed logic. Static storage = zero-init.
 static std::atomic<uint64_t> g_drej_count[7];
+// drejdim: refused-pair forensics (log-only, never read by feed logic).
+// Packed pairs (w<<32|h) so writer and trace logger share one atomic --
+// no torn reads across threads. Mirrors are reset at every slot fire and
+// rewritten at resolve; early-out passes print 0s, never frozen echoes.
+static std::atomic<uint64_t> g_clast_drpair{ 0 };  // resolve-time render dims (slot t2)
+static std::atomic<uint64_t> g_clast_dcpair{ 0 };  // refused cache dims (non-zero only on drej==3)
+static std::atomic<uint64_t> g_clast_drtpair{ 0 }; // paired RT dims the examined cache admitted against
+static std::atomic<uint64_t> g_clast_dcptr{ 0 };   // examined cache resource identity (never dereferenced)
+static std::atomic<int> g_clast_dcfmt{ 0 };        // examined cache DXGI format
+// clobber: times the no-overwrite rule blocked a non-exact admit over an
+// exactly-render-sized same-frame entry (cumulative since boot;
+// delta-able per stretch like drejc/dskip).
+static std::atomic<uint64_t> g_depth_clobber{ 0 };
 // M11 one-shot compute-slot tools (masterless): I/O logger + CB0 dumper.
 static std::atomic<bool> g_clog_slot{ false };
 static std::atomic<bool> g_cdump_cb{ false };
@@ -1939,8 +1955,9 @@ public:
                        // (Session-C proof: 800x450 depth vs 1600x900 color.)
                        // M64 1px overscan pairs still pass; anything further
                        // apart is a different target, not scene depth.
-                       bool depthGameplay = false;
-                       {
+                        bool depthGameplay = false;
+                        uint32_t crtw = 0, crth = 0; // paired RT dims for the store branch (refused-pair forensics)
+                        {
                           ID3D11RenderTargetView* crtv = nullptr;
                           native_device_context->OMGetRenderTargets(1, &crtv, nullptr);
                           if (crtv)
@@ -1952,12 +1969,31 @@ public:
                                 ID3D11Texture2D* ctex = nullptr;
                                 if (SUCCEEDED(cres->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ctex))) && ctex)
                                 {
-                                   D3D11_TEXTURE2D_DESC crd = {};
-                                   ctex->GetDesc(&crd);
+                                    D3D11_TEXTURE2D_DESC crd = {};
+                                    ctex->GetDesc(&crd);
+                                    crtw = crd.Width; crth = crd.Height;
                                     uint32_t dw = d.Width > crd.Width ? d.Width - crd.Width : crd.Width - d.Width;
                                     // dhfix: then-branch was (crd.Height - crd.Height) == 0, so any TALLER foreign DSV passed the <=4px gate and poisoned the cache (drej 3 stops at the angles whose draw order leaves it bound last).
                                     uint32_t dh = d.Height > crd.Height ? d.Height - crd.Height : crd.Height - d.Height;
-                                   depthGameplay = (crd.Width >= 400 && crd.Height >= 200 && dw <= 4 && dh <= 4);
+                                    // clobber: size the DSV against RENDER dims (last resolve), not the
+                                    // paired RT -- a self-consistent foreign pair (960x540 RT + 960x540
+                                    // DSV) must take the dskip path and never overwrite. RT~=DSV is only
+                                    // the pre-first-resolve fallback (render mirror still 0x0). The RT
+                                    // itself must still be gameplay-sized (kills depth-only shadow draws).
+                                    // Tolerance stays +-4 (overscan question OPEN -- the trace decides).
+                                    uint64_t clrp = g_clast_drpair.load(std::memory_order_relaxed);
+                                    uint32_t clrw = (uint32_t)(clrp >> 32), clrh = (uint32_t)(clrp & 0xFFFFFFFFu);
+                                    bool rknown = (clrw != 0 && clrh != 0);
+                                    bool sizeOk;
+                                    if (rknown)
+                                    {
+                                       uint32_t sw = d.Width > clrw ? d.Width - clrw : clrw - d.Width;
+                                       uint32_t sh = d.Height > clrh ? d.Height - clrh : clrh - d.Height;
+                                       sizeOk = (sw <= 4 && sh <= 4);
+                                    }
+                                    else
+                                       sizeOk = (dw <= 4 && dh <= 4);
+                                    depthGameplay = (crd.Width >= 400 && crd.Height >= 200 && sizeOk);
                                    ctex->Release();
                                 }
                                 cres->Release();
@@ -1965,14 +2001,38 @@ public:
                              crtv->Release();
                           }
                        }
-                      if (depthGameplay)
-                      {
-                      auto& gd = *static_cast<DaysGoneDeviceData*>(device_data.game);
-                      gd.cached_depth.attach(tmp);
-                     tmp = nullptr;
-                     gd.cached_depth_frame = g_hist_frame.load(std::memory_order_relaxed);
-                     gd.cached_depth_w = d.Width; gd.cached_depth_h = d.Height;
-                      }
+                       if (depthGameplay)
+                       {
+                       auto& gd = *static_cast<DaysGoneDeviceData*>(device_data.game);
+                       // clobber: no-overwrite rule. A non-EXACT admit must not displace an
+                       // exactly-render-sized same-frame entry (foreign pass arriving late
+                       // would otherwise poison a good cache). Render dims from the last
+                       // resolve; unknown (boot/pre-first-fire) disables the rule and the
+                       // gate above already fell back to RT-sizing. Near (±4, non-exact)
+                       // admits still flow when the slot is free -- overscan question OPEN.
+                       // Blocked stores keep tmp alive for the Release below (no leak).
+                       uint64_t clrp2 = g_clast_drpair.load(std::memory_order_relaxed);
+                       uint32_t clrw2 = (uint32_t)(clrp2 >> 32), clrh2 = (uint32_t)(clrp2 & 0xFFFFFFFFu);
+                       bool ex_match = (clrw2 != 0 && clrh2 != 0) && gd.cached_depth &&
+                          gd.cached_depth_frame == cur_frame &&
+                          gd.cached_depth_w == clrw2 && gd.cached_depth_h == clrh2;
+                       bool new_exact = (clrw2 != 0 && clrh2 != 0) &&
+                          d.Width == clrw2 && d.Height == clrh2;
+                       if (ex_match && !new_exact)
+                       {
+                          g_depth_clobber.fetch_add(1, std::memory_order_relaxed);
+                          g_depth_cache_skips.fetch_add(1, std::memory_order_relaxed);
+                       }
+                       else
+                       {
+                       gd.cached_depth.attach(tmp);
+                      tmp = nullptr;
+                      gd.cached_depth_frame = g_hist_frame.load(std::memory_order_relaxed);
+                      gd.cached_depth_w = d.Width; gd.cached_depth_h = d.Height;
+                      gd.cached_rt_w = crtw; gd.cached_rt_h = crth;
+                      gd.cached_depth_fmt = (int)d.Format;
+                       }
+                       }
                       else
                          g_depth_cache_skips.fetch_add(1, std::memory_order_relaxed);
                    }
@@ -2252,7 +2312,15 @@ public:
          {
 #if ENABLE_SR
              g_cdlss_attempts.fetch_add(1, std::memory_order_relaxed);
-             g_cdlss_last_fire.store(g_hist_frame.load(std::memory_order_relaxed), std::memory_order_relaxed); // M53: auto-unpark heartbeat
+              g_cdlss_last_fire.store(g_hist_frame.load(std::memory_order_relaxed), std::memory_order_relaxed); // M53: auto-unpark heartbeat
+              // clobber/drejdim: clear per-fire mirrors so early-out passes (master-off,
+              // sr-None, no-instance) print 0s instead of frozen echoes. The resolve
+              // block rewrites them when it runs; counters (drejc/clobber) never reset.
+              g_clast_drpair.store(0, std::memory_order_relaxed);
+              g_clast_dcpair.store(0, std::memory_order_relaxed);
+              g_clast_drtpair.store(0, std::memory_order_relaxed);
+              g_clast_dcptr.store(0, std::memory_order_relaxed);
+              g_clast_dcfmt.store(0, std::memory_order_relaxed);
              bool is_imm_c = (native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE);
             // One-shot I/O logger (masterless): u0/u1 + t0-t3 dims.
             if (g_clog_slot.exchange(false, std::memory_order_relaxed) && is_imm_c)
@@ -2815,6 +2883,20 @@ public:
                              drej = t1_is_depth ? 5 : 4;
                           g_clast_dreason.store(drej, std::memory_order_relaxed);
                           g_drej_count[drej].fetch_add(1, std::memory_order_relaxed); // drejcount (drej is 0..6 here by construction)
+                          // drejdim: mirror the check-point pair (crw/crh + gdd are in scope
+                          // here -- sampled at resolve, never re-read at trace time).
+                          g_clast_drpair.store((((uint64_t)(uint32_t)crw) << 32) | (uint64_t)(uint32_t)crh, std::memory_order_relaxed);
+                          // Cache trio only when a cached image was actually examined; the
+                          // refused dims (dcpair) only on the size-refusal path -- every
+                          // other path prints 0x0 (reset above, no frozen echoes).
+                          if (gdd.cached_depth)
+                          {
+                             if (drej == 3)
+                                g_clast_dcpair.store((((uint64_t)gdd.cached_depth_w) << 32) | (uint64_t)gdd.cached_depth_h, std::memory_order_relaxed);
+                             g_clast_drtpair.store((((uint64_t)gdd.cached_rt_w) << 32) | (uint64_t)gdd.cached_rt_h, std::memory_order_relaxed);
+                             g_clast_dcptr.store((uint64_t)gdd.cached_depth.get(), std::memory_order_relaxed);
+                             g_clast_dcfmt.store(gdd.cached_depth_fmt, std::memory_order_relaxed);
+                          }
                        }
                        { // Round2: fed-depth dims straight from the resource
                           // (proves base-mip full-res; GetDesc reads the TEXTURE,
@@ -5589,6 +5671,18 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    uint64_t drejc[7] = {};
    for (int i = 0; i < 7; i++)
       drejc[i] = g_drej_count[i].load(std::memory_order_relaxed);
+   // drejdim/clobber: refused-pair dims + cache identity for the tail. Plain
+   // locals through varargs (atomics never cross the call); pairs split here
+   // from single atomic loads, so writer/tracer cannot tear a pair.
+   uint64_t rdpair = g_clast_drpair.load(std::memory_order_relaxed);
+   uint64_t dcpair = g_clast_dcpair.load(std::memory_order_relaxed);
+   uint64_t drtpair = g_clast_drtpair.load(std::memory_order_relaxed);
+   uint64_t dcptr = g_clast_dcptr.load(std::memory_order_relaxed);
+   int dcfmt = g_clast_dcfmt.load(std::memory_order_relaxed);
+   uint64_t clob = g_depth_clobber.load(std::memory_order_relaxed);
+   unsigned rdrw = (unsigned)(rdpair >> 32), rdrh = (unsigned)(rdpair & 0xFFFFFFFFu);
+   unsigned rdcw = (unsigned)(dcpair >> 32), rdch = (unsigned)(dcpair & 0xFFFFFFFFu);
+   unsigned rdtw = (unsigned)(drtpair >> 32), rdth = (unsigned)(drtpair & 0xFFFFFFFFu);
    int cvsrc = g_cview_stash_src.load(std::memory_order_relaxed);
    int cvok = g_cview_stash_ok.load(std::memory_order_relaxed);
    char cvreason[96] = {};
@@ -5645,7 +5739,7 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    // margin. snprintf stays truncation-safe regardless -- never fail-fast.
    char line[2048] = {};
    snprintf(line, sizeof(line),
-      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jsrc=%s jitraw=%.6f,%.6f,%.2f,%.2f,%.2f,%.2f jmean=%.3f,%.3f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu dskip=%llu cc=%llu ddim=%ux%u th=%08X tph=%08X rck=%08X rpck=%08X mainview=%d drej=%d drejc=%llu,%llu,%llu,%llu,%llu,%llu,%llu",
+      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jsrc=%s jitraw=%.6f,%.6f,%.2f,%.2f,%.2f,%.2f jmean=%.3f,%.3f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu dskip=%llu cc=%llu ddim=%ux%u th=%08X tph=%08X rck=%08X rpck=%08X mainview=%d drej=%d drejc=%llu,%llu,%llu,%llu,%llu,%llu,%llu rdim=%ux%u dcw=%ux%u drt=%ux%u dcptr=%llX dcfmt=%d clob=%llu",
       (unsigned long long)present, DG_BUILD_ID,
       (unsigned long long)draws, (unsigned long long)frozen,
       (unsigned long long)att, (unsigned long long)runs, (unsigned long long)resets,
@@ -5654,7 +5748,8 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
       cown, cmsc, cmvsjit, cdec, cfx, cfy, csc, con, fovsl, fovtrue, (unsigned long long)fi, fibang,
       (unsigned long long)dage, (unsigned long long)dskip, (unsigned long long)ccv, ddw, ddh, (unsigned)th, (unsigned)tph,
       (unsigned)rck, (unsigned)rpck, mainview,
-      drejlast, (unsigned long long)drejc[0], (unsigned long long)drejc[1], (unsigned long long)drejc[2], (unsigned long long)drejc[3], (unsigned long long)drejc[4], (unsigned long long)drejc[5], (unsigned long long)drejc[6]);
+      drejlast, (unsigned long long)drejc[0], (unsigned long long)drejc[1], (unsigned long long)drejc[2], (unsigned long long)drejc[3], (unsigned long long)drejc[4], (unsigned long long)drejc[5], (unsigned long long)drejc[6],
+      rdrw, rdrh, rdcw, rdch, rdtw, rdth, (unsigned long long)dcptr, dcfmt, (unsigned long long)clob);
 #if TEST || DEVELOPMENT
    AppendFullLogLine(hModule, line);
 #else
