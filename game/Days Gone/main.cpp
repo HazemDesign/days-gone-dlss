@@ -43,6 +43,11 @@ static std::atomic<uint64_t> g_hist_frame{ 0 };
 static HMODULE g_marker_module = nullptr;
 static void WriteLoadMarker(HMODULE hModule, const char* phase);
 static void WriteFullLine(HMODULE hModule, uint64_t present);
+#if TEST || DEVELOPMENT
+// Cifix: AppendFullLogLine is defined near the file writers (below); the M11
+// depth-warn and first-Draw sites above need it declared first.
+static void AppendFullLogLine(HMODULE hModule, const char* text);
+#endif
 
 // Histograms + freezer work in ALL configs (M5b: Publishing showed an empty
 // menu because publishing never populated them). Only file logging stays
@@ -1050,7 +1055,7 @@ static void LogDepthValueDiag(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D1
    char b[256];
    if (!res) { snprintf(b, sizeof(b), "DaysGone cSTATS depth-diag %s=null", name); reshade::log::message(reshade::log::level::info, b); return; }
    ComPtr<ID3D11Texture2D> t;
-   if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t.put()))) || !t)
+   if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(t.put()))) || !t)
    { snprintf(b, sizeof(b), "DaysGone cSTATS depth-diag %s=n2d", name); reshade::log::message(reshade::log::level::info, b); return; }
    D3D11_TEXTURE2D_DESC d = {};
    t->GetDesc(&d);
@@ -2486,7 +2491,7 @@ public:
                           ID3D11Resource* prot = nullptr;
                           if (far_[2]) far_[2]->GetResource(&prot);
                           ComPtr<ID3D11Texture2D> ptex;
-                          if (prot && SUCCEEDED(prot->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ptex))) && ptex)
+                          if (prot && SUCCEEDED(prot->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(ptex.put()))) && ptex)
                           {
                              D3D11_TEXTURE2D_DESC pdd = {};
                              ptex->GetDesc(&pdd);
@@ -2813,7 +2818,7 @@ public:
                           if (c_depth)
                           {
                              ComPtr<ID3D11Texture2D> ddt;
-                             if (SUCCEEDED(c_depth->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ddt))) && ddt)
+                             if (SUCCEEDED(c_depth->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(ddt.put()))) && ddt)
                              {
                                 D3D11_TEXTURE2D_DESC ddd = {};
                                 ddt->GetDesc(&ddd);
@@ -3249,7 +3254,7 @@ public:
                            // above is actually rescaling live data).
                            {
                               ComPtr<ID3D11Texture2D> hmt;
-                              if (mv_sel && SUCCEEDED(mv_sel->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&hmt))) && hmt)
+                              if (mv_sel && SUCCEEDED(mv_sel->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(hmt.put()))) && hmt)
                               {
                                  D3D11_TEXTURE2D_DESC hmd = {};
                                  hmt->GetDesc(&hmd);
@@ -3338,7 +3343,7 @@ public:
                           if (c_mv_res)
                           {
                              ComPtr<ID3D11Texture2D> mvt;
-                             if (SUCCEEDED(c_mv_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&mvt))) && mvt)
+                             if (SUCCEEDED(c_mv_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(mvt.put()))) && mvt)
                              {
                                 D3D11_TEXTURE2D_DESC mvd = {};
                                 mvt->GetDesc(&mvd);
@@ -5563,8 +5568,6 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
          mainview = (dr <= 0.03f) ? 1 : 0;
       }
    }
-   uint32_t ddw = g_clast_ddw.load(std::memory_order_relaxed);
-   uint32_t ddh = g_clast_ddh.load(std::memory_order_relaxed);
    uint64_t dskip = g_depth_cache_skips.load(std::memory_order_relaxed);
    uint64_t ccv = g_color_changes.load(std::memory_order_relaxed);
    int cvsrc = g_cview_stash_src.load(std::memory_order_relaxed);
@@ -5614,7 +5617,7 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
       snprintf(cvst, sizeof(cvst), "%d:none", cvsrc);
    else
       snprintf(cvst, sizeof(cvst), "%d:%s%s%s", cvsrc, cvok ? "ok" : "fail:",
-         cvok ? "" : (cvreason[0] ? cvreason : "unknown"));
+         cvok ? "" : (cvreason[0] ? cvreason : "unknown"), "");
    // Worst-case growth of the new view-filter fields is ~60 chars; buffers
    // sized so the margin over the true worst case stays >= 400 (snprintf
    // stays sizeof-bounded regardless -- no repeat of the old overflow).
