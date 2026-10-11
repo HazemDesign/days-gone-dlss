@@ -34,7 +34,7 @@
 #define DG_HOTKEY_DLSS VK_F9
 #define DG_HOTKEY_TRACE VK_F10
 
-static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid-menuclean-mvraw-tracefix-cleanup-resfix-deep1-m7stub-trace1200-fov688-realfix-claudefix-depthangle-claude2";
+static const char* DG_BUILD_ID = "m55-2026-10-05-smallgates-viewfix-fulltrace-apifix2-zoomfix-viewscale-viewpick-perfcap-templog-crashfix-pics-allpasses-fullbundle-mvsrc-blitguard-bundlehang-shakediag-projhold-fullscale-hotkeys-viewfilter-depthfilter-mvscale2x-hybrid-menuclean-mvraw-tracefix-cleanup-resfix-deep1-m7stub-trace1200-fov688-realfix-claudefix-depthangle-claude2-m7viewretire-dhfix-drejcount";
 
 static std::atomic<uint64_t> g_draws_this_frame{ 0 };
 static std::atomic<uint64_t> g_draws_last_frame{ 0 };
@@ -370,6 +370,11 @@ static std::atomic<int> g_clast_jsrc{ 0 };
 // 3=cache-size, 4=t1-format, 5=t1-size, 6=none-native). Frequent 6 in normal
 // orbit = over-strict filter (watch this before tightening further).
 static std::atomic<int> g_clast_dreason{ -1 };
+// drejcount: per-reason depth-pick tallies, cumulative since boot (delta two
+// FULL lines = refusals per N frames; acceptance is drej 2-6 ~0 in steady
+// gameplay). Incremented once per compute-slot fire next to the reason store;
+// log-only, never read by feed logic. Static storage = zero-init.
+static std::atomic<uint64_t> g_drej_count[7];
 // M11 one-shot compute-slot tools (masterless): I/O logger + CB0 dumper.
 static std::atomic<bool> g_clog_slot{ false };
 static std::atomic<bool> g_cdump_cb{ false };
@@ -1949,8 +1954,9 @@ public:
                                 {
                                    D3D11_TEXTURE2D_DESC crd = {};
                                    ctex->GetDesc(&crd);
-                                   uint32_t dw = d.Width > crd.Width ? d.Width - crd.Width : crd.Width - d.Width;
-                                   uint32_t dh = d.Height > crd.Height ? crd.Height - crd.Height : crd.Height - d.Height;
+                                    uint32_t dw = d.Width > crd.Width ? d.Width - crd.Width : crd.Width - d.Width;
+                                    // dhfix: then-branch was (crd.Height - crd.Height) == 0, so any TALLER foreign DSV passed the <=4px gate and poisoned the cache (drej 3 stops at the angles whose draw order leaves it bound last).
+                                    uint32_t dh = d.Height > crd.Height ? d.Height - crd.Height : crd.Height - d.Height;
                                    depthGameplay = (crd.Width >= 400 && crd.Height >= 200 && dw <= 4 && dh <= 4);
                                    ctex->Release();
                                 }
@@ -2808,6 +2814,7 @@ public:
                           else if (t1w || t1h)
                              drej = t1_is_depth ? 5 : 4;
                           g_clast_dreason.store(drej, std::memory_order_relaxed);
+                          g_drej_count[drej].fetch_add(1, std::memory_order_relaxed); // drejcount (drej is 0..6 here by construction)
                        }
                        { // Round2: fed-depth dims straight from the resource
                           // (proves base-mip full-res; GetDesc reads the TEXTURE,
@@ -4687,12 +4694,19 @@ public:
            if (ImGui::Combo("Compute viewer source", &cvv, cv_names, 12))
               g_cview_src.store(cvv - 1);
            // M59: exact NGX feeds (what DLSS really got, per path, named).
-           {
-              const char* fv_names[] = { "OFF", "M11 color (NGX src)", "M11 depth (NGX depth)", "M11 MV (NGX MV)", "M11 output (NGX out)", "M7 color (NGX src)", "M7 depth (NGX depth)", "M7 MV (NGX MV)", "M7 output (NGX out)" };
-              int fv = g_feedview.load() + 1;
-              if (fv < 0) fv = 0; if (fv > 8) fv = 8;
-              if (ImGui::Combo("DLSS feed (exact NGX input)", &fv, fv_names, 9))
-                 g_feedview.store(fv - 1);
+           // M7-retire: M7 combo items removed. Deepclean-m7stub deleted the
+           // StoreFeed(1,...) body, so g_feed_m7_* stay null forever and fsel
+           // 4-7 could only ever report "feed empty (path idle?)" -- a dead
+           // menu that can never display. M11 numbering (fsel 0-3) is
+           // unchanged; the refresh block still tolerates fsel 4-7
+           // defensively, and the M7 age line below is kept (it proves the
+           // stub state: never fed).
+            {
+               const char* fv_names[] = { "OFF", "M11 color (NGX src)", "M11 depth (NGX depth)", "M11 MV (NGX MV)", "M11 output (NGX out)" };
+               int fv = g_feedview.load() + 1;
+               if (fv < 0 || fv > 4) { fv = 0; g_feedview.store(-1); }
+               if (ImGui::Combo("DLSS feed (exact NGX input)", &fv, fv_names, 5))
+                  g_feedview.store(fv - 1);
               uint64_t curf = g_hist_frame.load(std::memory_order_relaxed);
               uint64_t f11 = g_feed_m11_frame.load(std::memory_order_relaxed);
               uint64_t f7 = g_feed_m7_frame.load(std::memory_order_relaxed);
@@ -5570,6 +5584,11 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    }
    uint64_t dskip = g_depth_cache_skips.load(std::memory_order_relaxed);
    uint64_t ccv = g_color_changes.load(std::memory_order_relaxed);
+   // drejcount: last reason + cumulative per-reason tallies for the FULL tail.
+   int drejlast = g_clast_dreason.load(std::memory_order_relaxed);
+   uint64_t drejc[7] = {};
+   for (int i = 0; i < 7; i++)
+      drejc[i] = g_drej_count[i].load(std::memory_order_relaxed);
    int cvsrc = g_cview_stash_src.load(std::memory_order_relaxed);
    int cvok = g_cview_stash_ok.load(std::memory_order_relaxed);
    char cvreason[96] = {};
@@ -5626,7 +5645,7 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
    // margin. snprintf stays truncation-safe regardless -- never fail-fast.
    char line[2048] = {};
    snprintf(line, sizeof(line),
-      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jsrc=%s jitraw=%.6f,%.6f,%.2f,%.2f,%.2f,%.2f jmean=%.3f,%.3f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu dskip=%llu cc=%llu ddim=%ux%u th=%08X tph=%08X rck=%08X rpck=%08X mainview=%d",
+      "full %llu build=%s draws=%llu frozen=%llu slot_att/slot_runs/slot_resets=%llu/%llu/%llu mv=%s mvhash=%08X mvfmt=%d mvsrc=%s mvcode=%d owng=%d vfp=%llu/%llu/%llu dlss_ok=%d dlss_reset=%d jit=%.2f,%.2f jsrc=%s jitraw=%.6f,%.6f,%.2f,%.2f,%.2f,%.2f jmean=%.3f,%.3f cview=%s freeze_master=%d view=%d/%d preads=%d pskip=%llu pickck=%08X rejD+%llu projrejD+%llu p%.3f,%.3f rot=%.4f cfg=%d.%d.%d.%d jm=%d.%d.%d.%d fov=%.3f:%.3f fidx=%llu%c dage=%llu dskip=%llu cc=%llu ddim=%ux%u th=%08X tph=%08X rck=%08X rpck=%08X mainview=%d drej=%d drejc=%llu,%llu,%llu,%llu,%llu,%llu,%llu",
       (unsigned long long)present, DG_BUILD_ID,
       (unsigned long long)draws, (unsigned long long)frozen,
       (unsigned long long)att, (unsigned long long)runs, (unsigned long long)resets,
@@ -5634,7 +5653,8 @@ static void WriteFullLine(HMODULE hModule, uint64_t present)
       vpick, vnpool, preads, pskip, (unsigned)pickck, (unsigned long long)drej, (unsigned long long)dproj, vp00, vp11, rotmag,
       cown, cmsc, cmvsjit, cdec, cfx, cfy, csc, con, fovsl, fovtrue, (unsigned long long)fi, fibang,
       (unsigned long long)dage, (unsigned long long)dskip, (unsigned long long)ccv, ddw, ddh, (unsigned)th, (unsigned)tph,
-      (unsigned)rck, (unsigned)rpck, mainview);
+      (unsigned)rck, (unsigned)rpck, mainview,
+      drejlast, (unsigned long long)drejc[0], (unsigned long long)drejc[1], (unsigned long long)drejc[2], (unsigned long long)drejc[3], (unsigned long long)drejc[4], (unsigned long long)drejc[5], (unsigned long long)drejc[6]);
 #if TEST || DEVELOPMENT
    AppendFullLogLine(hModule, line);
 #else
