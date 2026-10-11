@@ -46,6 +46,22 @@ buffers); this note is the procedure around it.
 - Dims proof pack: FULL `ddim=` MUST equal render dims on every fed frame
   (0/0 = no depth fed = native fallback, by design); AUDIT `mvres=` MUST
   equal render (a mismatch now warns + falls back instead of half-feeding).
+- Depth-refusal counters (build `-drejcount` and later): the FULL tail
+  carries `drej=` (last depth-pick reason that frame: 0 cache-fed,
+  1 t1-fed, 2 cache-stale, 3 cache-size, 4 t1-format, 5 t1-size,
+  6 none-native) plus cumulative `drejc=` tallies (reasons 0..6) since
+  boot. Acceptance math: delta `drejc` between two FULL lines divided
+  by presents elapsed = refusals per frame per reason — drej 2-6 must
+  read ~0 over 1000 steady gameplay frames. `ddim=0/0` with frozen
+  `dlss_ok`/`runs` = the refused frame went native (by design, never
+  softened); `dage>0` = stale-cache stretch (drej 2/3 territory).
+- Feed viewer offers M11 sources only (`M11 color/depth/MV/out` — dead
+  M7 entries retired; the M7 pixel path is stubbed so its slots stay
+  null forever and could only ever print `feed empty`). `dskip=`
+  climbs on refused foreign DSVs: post-`dhfix` the height gate is
+  symmetric again, so taller-than-RT DSVs no longer poison the cache —
+  angle-stops that used to read drej 3 should now read as skips with
+  DLSS staying fed (cache-DSV or slot-t1).
 - T-row proof pack: FULL `th=`/`tph=` — assert `tph(n)==th(n-1)` bitwise
   across fed frames (vfp/fidx stamps); `rck=`/`rpck=` rotation checksums do
   the same for the jitter-free R rows; `mainview=1` required (0 = secondary
